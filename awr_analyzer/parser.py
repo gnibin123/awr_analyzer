@@ -49,6 +49,31 @@ def _to_float(text: Optional[str]):
     return -value if negative else value
 
 
+_DURATION_RE = re.compile(r"^([\d,]+\.?\d*)\s*(ms|us|micros?|s|sec|min|hr)?$", re.I)
+_DURATION_FACTOR_TO_MS = {
+    "ms": 1.0, "us": 0.001, "micro": 0.001, "micros": 0.001,
+    "s": 1000.0, "sec": 1000.0, "min": 60000.0, "hr": 3600000.0,
+}
+
+
+def _parse_duration_ms(text: Optional[str]):
+    """Parses an AWR duration cell into milliseconds. Some AWR report
+    styles print a bare number (already in ms); others append a unit
+    suffix directly onto the number (e.g. '25.67ms', '266.76us')."""
+    if text is None:
+        return None
+    text = _norm(text).replace(",", "")
+    if not text or text in ("-", "N/A", "n/a"):
+        return None
+    m = _DURATION_RE.match(text)
+    if not m:
+        return _to_float(text)
+    value = float(m.group(1))
+    unit = (m.group(2) or "ms").lower()
+    factor = _DURATION_FACTOR_TO_MS.get(unit, 1.0)
+    return value * factor
+
+
 def _norm(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -68,18 +93,28 @@ def _row_cells(row: Tag):
     return [_norm(c.get_text(" ")) for c in row.find_all(["td", "th"])]
 
 
-def _nearby_heading_text(table: Tag, max_chars: int = 400) -> str:
+_HEADING_TAG_NAMES = ("h1", "h2", "h3", "h4")
+
+# Real AWR reports scatter "Back to <Section Name>" navigation links between
+# tables (e.g. "Back to Tablespace IO Stats"). Since those link texts contain
+# a real section name, they can masquerade as the heading for a *later,
+# unrelated* table if we're not careful to ignore them.
+_NAV_LINK_RE = re.compile(r"^back to\b", re.I)
+
+
+def _nearby_heading_text(table: Tag, max_chars: int = 800) -> str:
     """Collects the text that appears just before ``table`` in document
-    order, stopping once we've walked back past the previous table (so we
-    don't pick up an earlier section's trailing content)."""
+    order, stopping once we've walked back past the previous table or a
+    heading tag (so we don't pick up an earlier section's trailing content),
+    and skipping "Back to ..." navigation links."""
     parts = []
     total_len = 0
     for el in table.previous_elements:
-        if isinstance(el, Tag) and el.name == "table":
+        if isinstance(el, Tag) and (el.name == "table" or el.name in _HEADING_TAG_NAMES):
             break
         if isinstance(el, NavigableString):
             text = str(el).strip()
-            if text:
+            if text and not _NAV_LINK_RE.match(text):
                 parts.append(text)
                 total_len += len(text)
         if total_len >= max_chars:
@@ -97,7 +132,7 @@ _SECTION_PATTERNS = [
     ("sql_executions", re.compile(r"sql ordered by executions", re.I)),
     ("tablespace_io", re.compile(r"tablespace io stats", re.I)),
     ("undo", re.compile(r"undo segment", re.I)),
-    ("wait_class", re.compile(r"wait classes? by total wait time", re.I)),
+    ("wait_class", re.compile(r"wait classes? by total wait time|^foreground wait class$", re.I)),
     ("top_wait_events", re.compile(
         r"top \d+ timed (foreground )?events|foreground wait events|top timed events", re.I)),
     ("time_model", re.compile(r"time model statistics", re.I)),
@@ -108,18 +143,52 @@ _SECTION_PATTERNS = [
 ]
 
 
-def _classify_table(table: Tag) -> Optional[str]:
-    heading = _nearby_heading_text(table)
+def _match_section(text: str) -> Optional[str]:
     best_key = None
     best_pos = -1
     for key, pattern in _SECTION_PATTERNS:
         m = None
-        for m in pattern.finditer(heading):
+        for m in pattern.finditer(text):
             pass
         if m and m.end() > best_pos:
             best_pos = m.end()
             best_key = key
     return best_key
+
+
+def _classify_table(table: Tag) -> Optional[str]:
+    """Walks backward from ``table`` once, collecting text (skipping "Back
+    to ..." nav links) until it hits either another table or a heading tag.
+
+    A heading tag (e.g. <h3 class="awr">SQL ordered by Elapsed Time</h3>,
+    common in modern AWR reports) is a strong signal: if its own text
+    matches a known section, that wins immediately — regardless of how much
+    footnote text sits between the heading and the table. If the heading
+    doesn't match anything, we still stop there (a heading marks a section
+    boundary) and fall back to matching whatever plain text we collected
+    before it — which is how older AWR reports label sections like "Load
+    Profile" with bare text and no wrapping tag at all.
+    """
+    parts = []
+    total_len = 0
+    for el in table.previous_elements:
+        if isinstance(el, Tag) and el.name == "table":
+            break
+        if isinstance(el, Tag) and el.name in _HEADING_TAG_NAMES:
+            heading_text = _norm(el.get_text(" "))
+            key = _match_section(heading_text)
+            if key:
+                return key
+            break
+        if isinstance(el, NavigableString):
+            text = str(el).strip()
+            if text and not _NAV_LINK_RE.match(text):
+                parts.append(text)
+                total_len += len(text)
+        if total_len >= 800:
+            break
+    parts.reverse()
+    return _match_section(_norm(" ".join(parts)))
 
 
 def _header_index(headers: list, *patterns: str) -> Optional[int]:
@@ -203,14 +272,23 @@ def _parse_header_info(soup: BeautifulSoup, report: AWRReport) -> None:
 
     for table in soup.find_all("table"):
         headers = [ _key(c) for c in _row_cells(table.find("tr")) ] if table.find("tr") else []
-        joined = " ".join(headers)
-        if {"db_name", "db_id", "instance"} <= set(headers) or ("db_name" in joined and "instance" in joined):
+        # DB identity and instance identity are sometimes two separate
+        # tables (modern multi-tenant/RAC-aware AWR reports) and sometimes
+        # one combined table (older reports) — handle both.
+        if "db_name" in headers and "db_id" in headers:
             data_row = table.find_all("tr")[1] if len(table.find_all("tr")) > 1 else None
             if data_row:
                 cells = _row_cells(data_row)
                 mapping = dict(zip(headers, cells))
                 info.db_name = mapping.get("db_name") or info.db_name
                 info.db_id = mapping.get("db_id") or info.db_id
+                info.release = mapping.get("release") or info.release
+                info.rac = mapping.get("rac") or info.rac
+        if "instance" in headers and ("inst_num" in headers or "db_name" in headers):
+            data_row = table.find_all("tr")[1] if len(table.find_all("tr")) > 1 else None
+            if data_row:
+                cells = _row_cells(data_row)
+                mapping = dict(zip(headers, cells))
                 info.instance_name = mapping.get("instance") or info.instance_name
                 info.instance_number = mapping.get("inst_num") or info.instance_number
                 info.release = mapping.get("release") or info.release
@@ -313,7 +391,7 @@ def _parse_wait_events(table: Tag, target: list, class_col_is_name: bool = False
             event=name,
             waits=_to_float(cells[idx_waits]) if idx_waits is not None and idx_waits < len(cells) else None,
             total_wait_time_sec=_to_float(cells[idx_time]) if idx_time is not None and idx_time < len(cells) else None,
-            avg_wait_ms=_to_float(cells[idx_avg]) if idx_avg is not None and idx_avg < len(cells) else None,
+            avg_wait_ms=_parse_duration_ms(cells[idx_avg]) if idx_avg is not None and idx_avg < len(cells) else None,
             pct_db_time=_to_float(cells[idx_pct]) if idx_pct is not None and idx_pct < len(cells) else None,
             wait_class=cells[idx_class] if idx_class is not None and idx_class < len(cells) else None,
         )

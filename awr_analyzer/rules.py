@@ -420,6 +420,12 @@ SQL_PCT_CRITICAL = 25.0
 TS_READ_MS_WARNING = 15.0
 TS_READ_MS_CRITICAL = 30.0
 
+# Minimum read count before trusting a tablespace's average read time at
+# all — with only a handful of reads in the snapshot window, one cold-cache
+# or first-touch read can swing the average wildly and isn't a reliable
+# signal of a real storage problem.
+TS_MIN_READS_FOR_LATENCY_CHECK = 100
+
 # Hard parse rate (parses per second) thresholds.
 HARD_PARSE_WARNING = 1.0
 HARD_PARSE_CRITICAL = 5.0

@@ -119,8 +119,6 @@ def _check_efficiency(report: AWRReport, findings: list) -> None:
 
 
 def _check_wait_events(report: AWRReport, findings: list) -> None:
-    db_time_sec = (report.info.db_time_minutes or 0) * 60
-
     for we in report.top_wait_events:
         name = (we.event or "").strip()
         if not name:
@@ -128,28 +126,37 @@ def _check_wait_events(report: AWRReport, findings: list) -> None:
         if re.search(r"cpu time|^db cpu$", name, re.I):
             continue  # handled separately by _check_cpu_load
 
+        # Trust only the report's own "% DB time" figure. Oracle leaves this
+        # blank for idle/background-style waits (job queue slaves, the
+        # watchdog loop, AQ message waits, ...) precisely because their raw
+        # wait time isn't comparable to DB time — computing our own ratio
+        # from total_wait_time_sec / db_time_sec produces nonsensical values
+        # (sometimes >100%) for exactly those events.
         pct = we.pct_db_time
-        if pct is None and db_time_sec and we.total_wait_time_sec is not None:
-            pct = (we.total_wait_time_sec / db_time_sec) * 100
 
         kb = rules.lookup_wait_event(name)
 
         is_idle = kb is not None and kb["category"] == "Idle/Network"
 
         severity = None
+        triggered_by = None
         if pct is not None and not is_idle:
             if pct >= rules.WAIT_EVENT_PCT_CRITICAL:
                 severity = "critical"
+                triggered_by = "pct"
             elif pct >= rules.WAIT_EVENT_PCT_WARNING:
                 severity = "warning"
+                triggered_by = "pct"
 
         # Special-case: sequential read latency can be a problem even if it's
         # not the single biggest contributor to DB time.
         if severity is None and re.search(r"^db file sequential read", name, re.I) and we.avg_wait_ms:
             if we.avg_wait_ms >= rules.SEQ_READ_MS_CRITICAL:
                 severity = "critical"
+                triggered_by = "latency"
             elif we.avg_wait_ms >= rules.SEQ_READ_MS_WARNING:
                 severity = "warning"
+                triggered_by = "latency"
 
         if severity is None:
             continue
@@ -178,10 +185,15 @@ def _check_wait_events(report: AWRReport, findings: list) -> None:
         pct_text = f"{pct:.1f}% of total DB time" if pct is not None else "a significant share of DB time"
         avg_text = f", averaging {we.avg_wait_ms:.2f} ms per wait" if we.avg_wait_ms is not None else ""
 
+        if triggered_by == "latency":
+            title = f"Elevated average latency on '{name}' ({we.avg_wait_ms:.2f} ms/wait)"
+        else:
+            title = f"High wait time on '{name}' ({pct_text})"
+
         findings.append(Finding(
             severity=severity,
             category=category,
-            title=f"High wait time on '{name}' ({pct_text})",
+            title=title,
             plain_explanation=plain,
             technical_detail=(
                 f"Event '{name}': {we.waits or 0:.0f} waits, "
@@ -368,6 +380,8 @@ def _check_tablespace_io(report: AWRReport, findings: list) -> None:
         ms = ts.avg_read_time_ms
         if ms is None:
             continue
+        if not ts.reads or ts.reads < rules.TS_MIN_READS_FOR_LATENCY_CHECK:
+            continue  # too few reads in the window for the average to be a reliable signal
         if ms >= rules.TS_READ_MS_CRITICAL:
             severity = "critical"
         elif ms >= rules.TS_READ_MS_WARNING:
