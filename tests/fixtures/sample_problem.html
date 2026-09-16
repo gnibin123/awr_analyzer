@@ -67,9 +67,26 @@ Top 5 Timed Foreground Events
 SQL ordered by Elapsed Time
 
 <table border="1">
-<tr><th>Elapsed Time (s)</th><th>Executions</th><th>Elapsed Time per Exec (s)</th><th>%Total</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
-<tr><td>22,000.00</td><td>800,000</td><td>0.0275</td><td>38.6</td><td>badsql000001</td><td>WebApp</td><td>SELECT * FROM big_table WHERE name LIKE '%'||:b1||'%'</td></tr>
-<tr><td>9,000.00</td><td>4</td><td>2,250.0000</td><td>15.8</td><td>slowbatch0002</td><td>NightlyBatch</td><td>MERGE INTO fact_sales USING staging_sales ...</td></tr>
+<tr><th>Elapsed Time (s)</th><th>Executions</th><th>Elapsed Time per Exec (s)</th><th>%Total</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+<tr><td>22,000.00</td><td>800,000</td><td>0.0275</td><td>38.6</td><td>15.0</td><td>80.0</td><td>badsql000001</td><td>WebApp</td><td>SELECT * FROM big_table WHERE name LIKE '%'||:b1||'%'</td></tr>
+<tr><td>9,000.00</td><td>4</td><td>2,250.0000</td><td>15.8</td><td>70.0</td><td>20.0</td><td>slowbatch0002</td><td>NightlyBatch</td><td>MERGE INTO fact_sales USING staging_sales ...</td></tr>
+<tr><td>300.00</td><td>200</td><td>1.5000</td><td>0.5</td><td>20.0</td><td>10.0</td><td>literalqry001</td><td>WebApp</td><td>SELECT * FROM customer_orders WHERE customer_id = 100045 AND status = 'OPEN'</td></tr>
+<tr><td>290.00</td><td>180</td><td>1.6000</td><td>0.5</td><td>20.0</td><td>10.0</td><td>literalqry002</td><td>WebApp</td><td>SELECT * FROM customer_orders WHERE customer_id = 200091 AND status = 'OPEN'</td></tr>
+<tr><td>280.00</td><td>190</td><td>1.5000</td><td>0.5</td><td>20.0</td><td>10.0</td><td>literalqry003</td><td>WebApp</td><td>SELECT * FROM customer_orders WHERE customer_id = 300012 AND status = 'OPEN'</td></tr>
+</table>
+
+SQL ordered by CPU Time
+
+<table border="1">
+<tr><th>CPU Time (s)</th><th>Executions</th><th>CPU per Exec (s)</th><th>%Total</th><th>Elapsed Time (s)</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+<tr><td>38.20</td><td>5,000</td><td>0.0080</td><td>12.0</td><td>95.50</td><td>40.0</td><td>10.0</td><td>abcd1234efghi</td><td>OrderApp</td><td>SELECT * FROM orders WHERE status = :b1</td></tr>
+</table>
+
+SQL ordered by Gets
+
+<table border="1">
+<tr><th>Buffer Gets</th><th>Executions</th><th>Gets per Exec</th><th>%Total</th><th>Elapsed Time (s)</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+<tr><td>160,000,000,000.00</td><td>800,000</td><td>200,000.0000</td><td>60.0</td><td>22,000.00</td><td>15.0</td><td>80.0</td><td>badsql000001</td><td>WebApp</td><td>SELECT * FROM big_table WHERE name LIKE '%'||:b1||'%'</td></tr>
 </table>
 
 Tablespace IO Stats

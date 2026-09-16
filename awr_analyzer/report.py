@@ -9,6 +9,7 @@ from __future__ import annotations
 import html as _html
 from datetime import datetime
 
+from . import rules
 from .models import AnalysisResult
 
 SEVERITY_META = {
@@ -70,6 +71,8 @@ def render_html(result: AnalysisResult, trend=None) -> str:
 
     findings_html = "".join(_render_finding(f) for f in result.findings)
 
+    sql_html = _render_sql_insights(result.sql_insights)
+
     trend_html = _render_trend(trend) if trend is not None else ""
 
     return f"""<!DOCTYPE html>
@@ -112,6 +115,13 @@ def render_html(result: AnalysisResult, trend=None) -> str:
   ul.recs li {{ margin-bottom: 0.3rem; }}
   table.trend {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
   table.trend th, table.trend td {{ text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #eee; }}
+  table.sql-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+  table.sql-table th {{ text-align: left; padding: 0.5rem 0.6rem; border-bottom: 2px solid #e2e5ea; white-space: nowrap; }}
+  table.sql-table td {{ text-align: left; padding: 0.4rem 0.6rem; vertical-align: top; }}
+  table.sql-table tr.sql-row td {{ border-top: 1px solid #eee; }}
+  table.sql-table tr.sql-text-row td {{ padding: 0 0.6rem 0.6rem 0.6rem; color: #777; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78rem; }}
+  .tag-chip {{ display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.72rem; font-weight: 600; margin: 0.1rem 0.25rem 0.1rem 0; white-space: nowrap; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }}
   .footer-note {{ color: #777; font-size: 0.8rem; margin-top: 2rem; }}
 </style>
 </head>
@@ -140,6 +150,8 @@ def render_html(result: AnalysisResult, trend=None) -> str:
 
   <h2 class="section-title">Findings ({len(result.findings)})</h2>
   {findings_html}
+
+  {sql_html}
 
   {trend_html}
 
@@ -174,6 +186,76 @@ def _render_finding(f) -> str:
         <div class="tech">{_e(f.technical_detail)}</div>
       </details>
     </div>
+    """
+
+
+def _render_sql_insights(sql_analysis) -> str:
+    if not sql_analysis or not sql_analysis.insights:
+        return ""
+
+    rank_key = lambda p: (p.severity_rank(), -(p.elapsed_s or 0))
+    ranked = sorted(sql_analysis.insights, key=rank_key)
+    shown = [p for p in ranked if p.tags][:15]
+    if not shown:
+        shown = ranked[:5]
+
+    rows = []
+    for p in shown:
+        meta = SEVERITY_META.get(p.severity, SEVERITY_META["info"])
+        tag_chips = "".join(
+            f'<span class="tag-chip" style="background:{meta["bg"]};color:{meta["color"]};">'
+            f'{_e(rules.SQL_TAG_INFO.get(t, {}).get("label", t))}</span>'
+            for t in p.tags
+        )
+        text_full = (p.sql_text or "").strip()
+        text_short = text_full[:90] + ("…" if len(text_full) > 90 else "")
+        cpu_io = "&mdash;"
+        if p.pct_cpu is not None or p.pct_io is not None:
+            cpu_io = f"{_fmt(p.pct_cpu, 0)}% / {_fmt(p.pct_io, 0)}%"
+
+        rows.append(f"""
+        <tr class="sql-row">
+          <td><code>{_e(p.sql_id)}</code></td>
+          <td>{_e(p.module) if p.module else '&mdash;'}</td>
+          <td>{_fmt(p.pct_elapsed, 1)}%</td>
+          <td>{_fmt(p.executions, 0)}</td>
+          <td>{_fmt(p.per_exec_s, 3)}</td>
+          <td>{cpu_io}</td>
+          <td>{_fmt(p.gets_per_exec, 0)}</td>
+          <td>{tag_chips or '&mdash;'}</td>
+        </tr>
+        <tr class="sql-text-row"><td colspan="8">{_e(text_short) if text_short else '&mdash;'}</td></tr>
+        """)
+
+    bind_block = ""
+    if sql_analysis.bind_variable_suspects:
+        items = "".join(
+            f"<li>{len(g.sql_ids)} SQL_IDs (module: {_e(g.module) if g.module else 'n/a'}) share what looks like "
+            f"the same statement once literal values are stripped out &mdash; likely missing bind variables.</li>"
+            for g in sql_analysis.bind_variable_suspects[:5]
+        )
+        bind_block = (
+            f'<div class="card"><h3 style="margin-top:0;">Possible missing bind variables</h3>'
+            f'<ul class="recs">{items}</ul></div>'
+        )
+
+    return f"""
+    <h2 class="section-title">Problematic Queries ({len(shown)} of {len(sql_analysis.insights)} profiled)</h2>
+    <p style="font-size:0.85rem;color:#666;">
+      Built by cross-referencing the "SQL ordered by ..." sections (Elapsed Time, CPU, Gets, Reads,
+      Executions). A statement missing a column below simply wasn't in that section's top list, not that
+      the value is zero.
+    </p>
+    <div class="card">
+      <table class="sql-table">
+        <tr>
+          <th>SQL ID</th><th>Module</th><th>% DB Time</th><th>Execs</th><th>Per-Exec (s)</th>
+          <th>%CPU / %IO</th><th>Gets/Exec</th><th>Flags</th>
+        </tr>
+        {''.join(rows)}
+      </table>
+    </div>
+    {bind_block}
     """
 
 
@@ -247,6 +329,33 @@ def render_text(result: AnalysisResult, trend=None) -> str:
         lines.append("")
         lines.append(f"  Technical detail: {f.technical_detail}")
         lines.append("")
+
+    sql_analysis = result.sql_insights
+    if sql_analysis and sql_analysis.insights:
+        rank_key = lambda p: (p.severity_rank(), -(p.elapsed_s or 0))
+        ranked = sorted(sql_analysis.insights, key=rank_key)
+        shown = [p for p in ranked if p.tags][:15] or ranked[:5]
+
+        lines.append("=" * 72)
+        lines.append(f"PROBLEMATIC QUERIES ({len(shown)} of {len(sql_analysis.insights)} profiled)")
+        lines.append("=" * 72)
+        for p in shown:
+            tag_labels = ", ".join(rules.SQL_TAG_INFO.get(t, {}).get("label", t) for t in p.tags) or "—"
+            cpu_io = ""
+            if p.pct_cpu is not None or p.pct_io is not None:
+                cpu_io = f", %CPU={p.pct_cpu if p.pct_cpu is not None else 'n/a'}, %IO={p.pct_io if p.pct_io is not None else 'n/a'}"
+            lines.append(f"  {p.sql_id} [{tag_labels}]")
+            lines.append(f"    %DBtime={_fmt(p.pct_elapsed, 1)}, executions={_fmt(p.executions, 0)}, "
+                         f"per_exec_s={_fmt(p.per_exec_s, 3)}, gets/exec={_fmt(p.gets_per_exec, 0)}{cpu_io}")
+            if p.sql_text:
+                lines.append(f"    text: {p.sql_text.strip()[:120]}")
+            lines.append("")
+
+        if sql_analysis.bind_variable_suspects:
+            lines.append("Possible missing bind variables:")
+            for g in sql_analysis.bind_variable_suspects[:5]:
+                lines.append(f"  - {len(g.sql_ids)} SQL_IDs (module: {g.module or 'n/a'}) share near-identical text")
+            lines.append("")
 
     if trend and trend.results:
         lines.append("=" * 72)

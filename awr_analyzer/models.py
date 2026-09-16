@@ -47,6 +47,11 @@ class SQLStat:
     pct_total: Optional[float] = None
     module: Optional[str] = None
     sql_text: Optional[str] = None
+    pct_cpu: Optional[float] = None        # % of this SQL's own elapsed time spent on CPU
+    pct_io: Optional[float] = None         # % of this SQL's own elapsed time spent on user I/O
+    elapsed_time_s: Optional[float] = None  # cross-referenced total elapsed time (present in most "ordered by" tables)
+    rows_processed: Optional[float] = None
+    rows_per_exec: Optional[float] = None
 
 
 @dataclass
@@ -130,6 +135,7 @@ class AnalysisResult:
     findings: list = field(default_factory=list)      # list[Finding]
     health_score: int = 100
     summary: str = ""
+    sql_insights: Optional["SQLAnalysis"] = None
 
     def findings_by_severity(self, severity: str):
         return [f for f in self.findings if f.severity == severity]
@@ -139,3 +145,63 @@ class AnalysisResult:
         for f in self.findings:
             counts[f.severity] = counts.get(f.severity, 0) + 1
         return counts
+
+
+@dataclass
+class SQLInsight:
+    """A merged, cross-referenced profile of a single SQL_ID, built by
+    combining whatever data is available about it across the different
+    "SQL ordered by ..." AWR sections, plus the tuning-relevant tags this
+    tool has derived from that profile (CPU-bound, missing-index suspect,
+    high call volume, ...).
+    """
+
+    sql_id: str
+    module: Optional[str] = None
+    sql_text: Optional[str] = None
+
+    executions: Optional[float] = None
+    elapsed_s: Optional[float] = None
+    pct_elapsed: Optional[float] = None
+    per_exec_s: Optional[float] = None
+
+    cpu_s: Optional[float] = None
+    pct_cpu: Optional[float] = None
+    pct_io: Optional[float] = None
+
+    gets: Optional[float] = None
+    gets_per_exec: Optional[float] = None
+    reads: Optional[float] = None
+    reads_per_exec: Optional[float] = None
+
+    rows_processed: Optional[float] = None
+    rows_per_exec: Optional[float] = None
+
+    seen_in: list = field(default_factory=list)     # which "SQL ordered by ..." lists mentioned this SQL_ID
+    tags: list = field(default_factory=list)        # e.g. ["cpu_bound", "missing_index_suspect"]
+    severity: str = "info"                          # critical | warning | info
+    notes: list = field(default_factory=list)       # plain-language notes, one per tag
+    recommendations: list = field(default_factory=list)
+
+    def severity_rank(self) -> int:
+        try:
+            return SEVERITY_ORDER.index(self.severity)
+        except ValueError:
+            return len(SEVERITY_ORDER)
+
+
+@dataclass
+class BindVariableSuspectGroup:
+    signature: str
+    sql_ids: list = field(default_factory=list)
+    module: Optional[str] = None
+    sample_text: Optional[str] = None
+
+
+@dataclass
+class SQLAnalysis:
+    insights: list = field(default_factory=list)                  # list[SQLInsight], sorted by elapsed_s desc
+    bind_variable_suspects: list = field(default_factory=list)    # list[BindVariableSuspectGroup]
+
+    def problematic(self):
+        return [i for i in self.insights if i.tags]

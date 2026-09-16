@@ -12,17 +12,20 @@ from __future__ import annotations
 import re
 
 from . import rules
+from . import sql_insights
 from .models import AnalysisResult, AWRReport, Finding
 
 
 def analyze(report: AWRReport) -> AnalysisResult:
     findings = []
 
+    sql_analysis = sql_insights.build_sql_insights(report)
+
     _check_efficiency(report, findings)
     _check_wait_events(report, findings)
     _check_cpu_load(report, findings)
     _check_parse_rate(report, findings)
-    _check_sql(report, findings)
+    _check_sql(sql_analysis, findings)
     _check_tablespace_io(report, findings)
 
     if not findings:
@@ -42,7 +45,10 @@ def analyze(report: AWRReport) -> AnalysisResult:
     findings.sort(key=lambda f: f.severity_rank())
     health_score = _health_score(findings)
     summary = _summary_text(report, findings, health_score)
-    return AnalysisResult(report=report, findings=findings, health_score=health_score, summary=summary)
+    return AnalysisResult(
+        report=report, findings=findings, health_score=health_score, summary=summary,
+        sql_insights=sql_analysis,
+    )
 
 
 def _health_score(findings) -> int:
@@ -308,70 +314,84 @@ def _check_parse_rate(report: AWRReport, findings: list) -> None:
     ))
 
 
-def _check_sql(report: AWRReport, findings: list) -> None:
-    db_time_sec = (report.info.db_time_minutes or 0) * 60
-    _check_sql_list(report.sql_by_elapsed, "elapsed time", db_time_sec, findings)
+def _check_sql(sql_analysis, findings: list) -> None:
+    problematic = [p for p in sql_analysis.insights if p.severity in ("critical", "warning")]
+    problematic.sort(key=lambda p: (p.severity_rank(), -(p.elapsed_s or 0)))
 
-
-def _check_sql_list(sql_list, metric_name: str, db_time_sec: float, findings: list) -> None:
-    for stat in sql_list[:5]:
-        if stat.value is None:
-            continue
-        pct = stat.pct_total
-        if pct is None and db_time_sec:
-            pct = (stat.value / db_time_sec) * 100
-        if pct is None:
-            continue
-
-        if pct >= rules.SQL_PCT_CRITICAL:
-            severity = "critical"
-        elif pct >= rules.SQL_PCT_WARNING:
-            severity = "warning"
-        else:
-            continue
+    for p in problematic[:8]:
+        tag_labels = ", ".join(rules.SQL_TAG_INFO[t]["label"] for t in p.tags)
 
         exec_note = ""
-        if stat.executions:
-            per_exec = stat.per_exec if stat.per_exec is not None else (stat.value / stat.executions if stat.executions else None)
-            exec_note = f" It ran {stat.executions:.0f} time(s)"
-            if per_exec is not None:
-                exec_note += f", averaging {per_exec:.3f}s per execution."
-            else:
-                exec_note += "."
+        if p.executions:
+            exec_note = f" It ran {p.executions:.0f} time(s)"
+            exec_note += f", averaging {p.per_exec_s:.3f}s per execution." if p.per_exec_s is not None else "."
 
-        text_snippet = (stat.sql_text or "").strip()
+        text_snippet = (p.sql_text or "").strip()
         if len(text_snippet) > 140:
             text_snippet = text_snippet[:140] + "..."
 
+        plain = " ".join(p.notes[:2]) + exec_note
+
+        detail_parts = [f"SQL_ID {p.sql_id}"]
+        if p.pct_elapsed is not None:
+            detail_parts.append(f"{p.pct_elapsed:.1f}% of total DB time")
+        if p.executions:
+            detail_parts.append(f"{p.executions:.0f} executions")
+        if p.gets_per_exec:
+            detail_parts.append(f"{p.gets_per_exec:,.0f} buffer gets/exec")
+        if p.reads_per_exec:
+            detail_parts.append(f"{p.reads_per_exec:,.0f} physical reads/exec")
+        if p.pct_cpu is not None:
+            detail_parts.append(f"%CPU={p.pct_cpu:.0f}")
+        if p.pct_io is not None:
+            detail_parts.append(f"%IO={p.pct_io:.0f}")
+        if text_snippet:
+            detail_parts.append(f"text: {text_snippet}")
+
         findings.append(Finding(
-            severity=severity,
+            severity=p.severity,
             category="SQL",
-            title=f"High-impact SQL: {stat.sql_id} ({pct:.1f}% of DB time by {metric_name})",
-            plain_explanation=(
-                f"This single SQL statement accounts for a large share of all database "
-                f"time on its own, based on {metric_name}.{exec_note} Statements like this "
-                f"are usually the highest-leverage place to focus tuning effort, since "
-                f"improving one query can measurably improve overall performance."
-            ),
-            technical_detail=(
-                f"SQL_ID {stat.sql_id}: {metric_name} = {stat.value:.2f}, "
-                f"{pct:.1f}% of total DB time" + (f", executions = {stat.executions:.0f}" if stat.executions else "") +
-                (f", text: {text_snippet}" if text_snippet else "")
-            ),
-            recommendations=[
-                f"Pull the execution plan for SQL_ID {stat.sql_id} (e.g. via "
-                f"DBMS_XPLAN.DISPLAY_CURSOR or SQL Tuning Advisor) and look for full table "
-                f"scans, poor join order, or missing indexes.",
-                "If it runs very frequently with a small per-execution cost, consider "
-                "whether it can be called less often (e.g. application-level caching) rather "
-                "than only tuning the SQL itself.",
-                "If it runs rarely but is very expensive per execution, focus on the "
-                "execution plan and indexing rather than call frequency.",
-            ],
+            title=f"Problematic SQL {p.sql_id}: {tag_labels}",
+            plain_explanation=plain,
+            technical_detail=", ".join(detail_parts),
+            recommendations=p.recommendations,
             evidence={
-                "sql_id": stat.sql_id, "value": stat.value, "pct_total": pct,
-                "executions": stat.executions, "metric": metric_name,
+                "sql_id": p.sql_id, "tags": p.tags, "pct_elapsed": p.pct_elapsed,
+                "executions": p.executions, "gets_per_exec": p.gets_per_exec,
+                "reads_per_exec": p.reads_per_exec, "pct_cpu": p.pct_cpu, "pct_io": p.pct_io,
             },
+        ))
+
+    if sql_analysis.bind_variable_suspects:
+        groups = sql_analysis.bind_variable_suspects[:5]
+        lines = []
+        for g in groups:
+            id_list = ", ".join(g.sql_ids[:5]) + ("..." if len(g.sql_ids) > 5 else "")
+            lines.append(f"{len(g.sql_ids)} SQL_IDs ({id_list})")
+
+        findings.append(Finding(
+            severity="warning",
+            category="Parsing",
+            title=f"Likely missing bind variables: {len(groups)} group(s) of near-identical SQL",
+            plain_explanation=(
+                "Several distinct SQL_IDs share what looks like the same statement once "
+                "literal values (numbers and quoted strings) are stripped out. This is the "
+                "classic signature of an application embedding literal values directly in "
+                "SQL text instead of using bind variables, which forces Oracle to hard-parse "
+                "and separately cache a version of the statement for every distinct value."
+            ),
+            technical_detail=" | ".join(lines),
+            recommendations=[
+                "Have the application use bind variables for these statements so identical "
+                "statement shapes share one parsed cursor instead of each literal value "
+                "creating a new hard-parsed copy.",
+                "Check the Soft Parse Ratio and hard-parse-rate findings elsewhere in this "
+                "report — this pattern is usually the direct cause of both.",
+            ],
+            evidence={"groups": [
+                {"signature": g.signature, "sql_ids": g.sql_ids, "module": g.module}
+                for g in groups
+            ]},
         ))
 
 

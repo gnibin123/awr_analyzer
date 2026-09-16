@@ -48,12 +48,14 @@ def test_parses_wait_events():
 
 def test_parses_sql_stats():
     report = parse_awr_file(str(FIXTURES / "sample_problem.html"))
-    assert len(report.sql_by_elapsed) == 2
+    assert len(report.sql_by_elapsed) == 5
     top = report.sql_by_elapsed[0]
     assert top.sql_id == "badsql000001"
     assert top.value == 22000.0
     assert top.executions == 800000
     assert top.pct_total == 38.6
+    assert top.pct_cpu == 15.0
+    assert top.pct_io == 80.0
 
 
 def test_parses_tablespace_io():

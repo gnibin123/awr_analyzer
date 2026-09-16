@@ -49,3 +49,20 @@ def test_render_text_with_trend():
     trend = build_trend(reports)
     out = render_text(result, trend=trend)
     assert "TREND ACROSS 3 REPORTS" in out
+
+
+def test_render_html_contains_problematic_queries_section():
+    report = parse_awr_file(str(FIXTURES / "sample_problem.html"))
+    result = analyze(report)
+    out = render_html(result)
+    assert "Problematic Queries" in out
+    assert "badsql000001" in out
+    assert "Possible missing bind variables" in out
+
+
+def test_render_text_contains_problematic_queries_section():
+    report = parse_awr_file(str(FIXTURES / "sample_problem.html"))
+    result = analyze(report)
+    out = render_text(result)
+    assert "PROBLEMATIC QUERIES" in out
+    assert "badsql000001" in out

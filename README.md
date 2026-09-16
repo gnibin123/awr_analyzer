@@ -24,9 +24,25 @@ creeping up) before they become outages.
     wait event actually means and what to check
   - CPU-bound workload detection
   - High hard-parse rates (usually a sign of missing bind variables)
-  - High-impact SQL statements (the ones responsible for the biggest share
-    of database time)
   - Tablespace I/O latency
+- **Profiles individual SQL statements** by cross-referencing all five "SQL
+  ordered by ..." sections (Elapsed Time, CPU, Gets, Reads, Executions) into
+  one view per SQL_ID, then flags:
+  - CPU-bound vs. I/O-bound statements (where a statement's own time is
+    actually going)
+  - Likely missing indexes / inefficient access paths (very high buffer
+    gets or physical reads per execution)
+  - Low-selectivity queries (reading far more blocks than the rows they
+    actually return)
+  - High call-volume statements worth caching/batching vs. expensive
+    low-frequency statements worth a one-off tuning pass
+  - Groups of near-identical statements that differ only in literal values
+    — a likely sign the application isn't using bind variables
+  Each flagged query gets plain-language reasoning plus concrete next
+  steps (what to check in the execution plan, what kind of index might
+  help, etc.), and the full ranked list — not just the ones that got
+  individually called out — appears in a dedicated "Problematic Queries"
+  table in the report.
 - **Explains** every finding in plain language (what's happening and why it
   matters) plus a technical detail line with the exact numbers, a severity
   (critical / warning / info), and concrete recommended actions.
@@ -132,8 +148,9 @@ awr_analyzer/
   models.py     # Data classes: AWRReport, Finding, AnalysisResult, ...
   rules.py      # Thresholds + plain-language knowledge base
   analyzer.py   # AWRReport -> list of Findings + health score
+  sql_insights.py  # Merges the "SQL ordered by ..." sections into per-query profiles + tags
   forecast.py   # Multiple AWRReports -> trend/forecast analysis
-  report.py     # Findings/trend -> HTML / text output
+  report.py     # Findings/trend/SQL insights -> HTML / text output
   cli.py        # Command-line entry point
 tests/
   fixtures/     # Synthetic AWR HTML fixtures + generator script

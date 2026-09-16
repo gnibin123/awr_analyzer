@@ -57,14 +57,28 @@ def _wait_event_rows(events: list) -> str:
     return "\n".join(rows)
 
 
-def _sql_rows(items: list, metric_header: str) -> str:
+def _sql_rows(items: list, with_xref: bool = False) -> str:
+    """Renders SQL statement rows. With with_xref=True, matches the layout
+    real AWR reports use for the CPU/Gets/Reads tables (which include a
+    cross-referenced Elapsed Time (s) column plus %CPU/%IO); otherwise
+    matches the Elapsed-Time table layout (%CPU/%IO right after %Total,
+    no separate elapsed column since it *is* the elapsed column)."""
     rows = []
     for s in items:
-        rows.append(
-            f"<tr><td>{s['value']:,.2f}</td><td>{s.get('executions',0):,.0f}</td>"
-            f"<td>{s.get('per_exec',0):,.4f}</td><td>{s.get('pct',0):,.1f}</td>"
-            f"<td>{s['sql_id']}</td><td>{s.get('module','')}</td><td>{s.get('text','')}</td></tr>"
-        )
+        cells = [
+            f"<td>{s['value']:,.2f}</td>",
+            f"<td>{s.get('executions', 0):,.0f}</td>",
+            f"<td>{s.get('per_exec', 0):,.4f}</td>",
+            f"<td>{s.get('pct', 0):,.1f}</td>",
+        ]
+        if with_xref:
+            cells.append(f"<td>{s.get('elapsed_s', 0):,.2f}</td>")
+        cells.append(f"<td>{s.get('pct_cpu', 0):,.1f}</td>")
+        cells.append(f"<td>{s.get('pct_io', 0):,.1f}</td>")
+        cells.append(f"<td>{s['sql_id']}</td>")
+        cells.append(f"<td>{s.get('module', '')}</td>")
+        cells.append(f"<td>{s.get('text', '')}</td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
     return "\n".join(rows)
 
 
@@ -91,6 +105,8 @@ def build_awr_html(
     efficiency_overrides=None,
     wait_events=None,
     sql_by_elapsed=None,
+    sql_by_cpu=None,
+    sql_by_gets=None,
     tablespace_io=None,
 ) -> str:
     load_profile_overrides = load_profile_overrides or {}
@@ -103,9 +119,21 @@ def build_awr_html(
     ]
     sql_by_elapsed = sql_by_elapsed if sql_by_elapsed is not None else [
         {"sql_id": "abcd1234efghi", "value": 95.5, "executions": 5000, "per_exec": 0.019, "pct": 6.3,
+         "pct_cpu": 40.0, "pct_io": 10.0,
          "module": "OrderApp", "text": "SELECT * FROM orders WHERE status = :b1"},
         {"sql_id": "zxywv9876mnop", "value": 60.2, "executions": 12, "per_exec": 5.02, "pct": 4.0,
+         "pct_cpu": 30.0, "pct_io": 20.0,
          "module": "BatchJob", "text": "UPDATE customer SET last_login = SYSDATE WHERE ..."},
+    ]
+    sql_by_cpu = sql_by_cpu if sql_by_cpu is not None else [
+        {"sql_id": "abcd1234efghi", "value": 38.2, "executions": 5000, "per_exec": 0.008, "pct": 12.0,
+         "elapsed_s": 95.5, "pct_cpu": 40.0, "pct_io": 10.0,
+         "module": "OrderApp", "text": "SELECT * FROM orders WHERE status = :b1"},
+    ]
+    sql_by_gets = sql_by_gets if sql_by_gets is not None else [
+        {"sql_id": "abcd1234efghi", "value": 45000.0, "executions": 5000, "per_exec": 9.0, "pct": 5.0,
+         "elapsed_s": 95.5, "pct_cpu": 40.0, "pct_io": 10.0,
+         "module": "OrderApp", "text": "SELECT * FROM orders WHERE status = :b1"},
     ]
     tablespace_io = tablespace_io if tablespace_io is not None else [
         {"name": "USERS", "reads": 42000, "avg_reads_s": 11.7, "avg_rd_ms": 6.5, "writes": 5000, "avg_writes_s": 1.4},
@@ -163,8 +191,22 @@ Top 5 Timed Foreground Events
 SQL ordered by Elapsed Time
 
 <table border="1">
-<tr><th>Elapsed Time (s)</th><th>Executions</th><th>Elapsed Time per Exec (s)</th><th>%Total</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
-{_sql_rows(sql_by_elapsed, "Elapsed Time (s)")}
+<tr><th>Elapsed Time (s)</th><th>Executions</th><th>Elapsed Time per Exec (s)</th><th>%Total</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+{_sql_rows(sql_by_elapsed, with_xref=False)}
+</table>
+
+SQL ordered by CPU Time
+
+<table border="1">
+<tr><th>CPU Time (s)</th><th>Executions</th><th>CPU per Exec (s)</th><th>%Total</th><th>Elapsed Time (s)</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+{_sql_rows(sql_by_cpu, with_xref=True)}
+</table>
+
+SQL ordered by Gets
+
+<table border="1">
+<tr><th>Buffer Gets</th><th>Executions</th><th>Gets per Exec</th><th>%Total</th><th>Elapsed Time (s)</th><th>%CPU</th><th>%IO</th><th>SQL Id</th><th>SQL Module</th><th>SQL Text</th></tr>
+{_sql_rows(sql_by_gets, with_xref=True)}
 </table>
 
 Tablespace IO Stats
@@ -209,9 +251,25 @@ if __name__ == "__main__":
         ],
         sql_by_elapsed=[
             {"sql_id": "badsql000001", "value": 22000.0, "executions": 800000, "per_exec": 0.0275, "pct": 38.6,
+             "pct_cpu": 15.0, "pct_io": 80.0,
              "module": "WebApp", "text": "SELECT * FROM big_table WHERE name LIKE '%'||:b1||'%'"},
             {"sql_id": "slowbatch0002", "value": 9000.0, "executions": 4, "per_exec": 2250.0, "pct": 15.8,
+             "pct_cpu": 70.0, "pct_io": 20.0,
              "module": "NightlyBatch", "text": "MERGE INTO fact_sales USING staging_sales ..."},
+            {"sql_id": "literalqry001", "value": 300.0, "executions": 200, "per_exec": 1.5, "pct": 0.5,
+             "pct_cpu": 20.0, "pct_io": 10.0,
+             "module": "WebApp", "text": "SELECT * FROM customer_orders WHERE customer_id = 100045 AND status = 'OPEN'"},
+            {"sql_id": "literalqry002", "value": 290.0, "executions": 180, "per_exec": 1.6, "pct": 0.5,
+             "pct_cpu": 20.0, "pct_io": 10.0,
+             "module": "WebApp", "text": "SELECT * FROM customer_orders WHERE customer_id = 200091 AND status = 'OPEN'"},
+            {"sql_id": "literalqry003", "value": 280.0, "executions": 190, "per_exec": 1.5, "pct": 0.5,
+             "pct_cpu": 20.0, "pct_io": 10.0,
+             "module": "WebApp", "text": "SELECT * FROM customer_orders WHERE customer_id = 300012 AND status = 'OPEN'"},
+        ],
+        sql_by_gets=[
+            {"sql_id": "badsql000001", "value": 160_000_000_000.0, "executions": 800000, "per_exec": 200000.0,
+             "pct": 60.0, "elapsed_s": 22000.0, "pct_cpu": 15.0, "pct_io": 80.0,
+             "module": "WebApp", "text": "SELECT * FROM big_table WHERE name LIKE '%'||:b1||'%'"},
         ],
         tablespace_io=[
             {"name": "USERS", "reads": 900000, "avg_reads_s": 250.0, "avg_rd_ms": 35.0, "writes": 50000, "avg_writes_s": 13.9},

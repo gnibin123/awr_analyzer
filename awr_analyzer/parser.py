@@ -452,6 +452,14 @@ def _parse_sql_table(table: Tag, target: list) -> None:
     idx_sqlid = _header_index(headers, r"sql ?id")
     idx_module = _header_index(headers, r"module")
     idx_text = _header_index(headers, r"sql text|text")
+    idx_pct_cpu = _header_index(headers, r"%\s*cpu")
+    idx_pct_io = _header_index(headers, r"%\s*io")
+    idx_elapsed_xref = _header_index(headers, r"elapsed\s*time\s*\(s\)")
+    idx_rows_processed = _header_index(headers, r"rows processed")
+    idx_rows_per_exec = _header_index(headers, r"rows per exec")
+
+    def cell(idx):
+        return cells[idx] if idx is not None and idx < len(cells) else None
 
     for row in rows[1:]:
         cells = _row_cells(row)
@@ -466,12 +474,17 @@ def _parse_sql_table(table: Tag, target: list) -> None:
             continue
         stat = SQLStat(
             sql_id=sql_id,
-            value=_to_float(cells[idx_value]) if idx_value is not None and idx_value < len(cells) else None,
-            executions=_to_float(cells[idx_exec]) if idx_exec is not None and idx_exec < len(cells) else None,
-            per_exec=_to_float(cells[idx_per_exec]) if idx_per_exec is not None and idx_per_exec < len(cells) else None,
-            pct_total=_to_float(cells[idx_pct]) if idx_pct is not None and idx_pct < len(cells) else None,
-            module=cells[idx_module] if idx_module is not None and idx_module < len(cells) else None,
-            sql_text=cells[idx_text] if idx_text is not None and idx_text < len(cells) else None,
+            value=_to_float(cell(idx_value)),
+            executions=_to_float(cell(idx_exec)),
+            per_exec=_to_float(cell(idx_per_exec)),
+            pct_total=_to_float(cell(idx_pct)),
+            module=cell(idx_module),
+            sql_text=cell(idx_text),
+            pct_cpu=_to_float(cell(idx_pct_cpu)),
+            pct_io=_to_float(cell(idx_pct_io)),
+            elapsed_time_s=_to_float(cell(idx_elapsed_xref)),
+            rows_processed=_to_float(cell(idx_rows_processed)),
+            rows_per_exec=_to_float(cell(idx_rows_per_exec)),
         )
         target.append(stat)
 

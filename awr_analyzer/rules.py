@@ -429,3 +429,194 @@ TS_MIN_READS_FOR_LATENCY_CHECK = 100
 # Hard parse rate (parses per second) thresholds.
 HARD_PARSE_WARNING = 1.0
 HARD_PARSE_CRITICAL = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Per-SQL-statement tuning thresholds and knowledge base. These drive the
+# per-query tags in sql_insights.py (CPU-bound, missing-index suspect,
+# high call volume, ...).
+# ---------------------------------------------------------------------------
+
+# % of a SQL statement's own elapsed time spent on CPU vs. waiting.
+SQL_CPU_BOUND_PCT = 60.0
+SQL_IO_BOUND_PCT = 40.0
+
+# Buffer gets (logical reads) per execution. High values on a frequently-run
+# statement are the classic signature of a missing index or an avoidable
+# full scan — Oracle has to walk far more blocks than a well-indexed access
+# path would need.
+SQL_GETS_PER_EXEC_WARNING = 10_000.0
+SQL_GETS_PER_EXEC_CRITICAL = 100_000.0
+
+# Physical reads (disk reads) per execution.
+SQL_READS_PER_EXEC_WARNING = 1_000.0
+SQL_READS_PER_EXEC_CRITICAL = 10_000.0
+
+# Buffer gets per row actually returned — a very strong selectivity signal:
+# reading thousands of blocks to return a handful of rows means the access
+# path isn't using the rows' actual selectivity.
+SQL_GETS_PER_ROW_WARNING = 1_000.0
+SQL_GETS_PER_ROW_CRITICAL = 10_000.0
+
+# A statement executed this many times in the snapshot window, while still
+# being a material contributor to DB time, is worth flagging as a caching/
+# batching candidate even if each individual execution is cheap.
+SQL_HIGH_VOLUME_EXECUTIONS = 50_000.0
+SQL_HIGH_VOLUME_MIN_PCT_ELAPSED = 5.0
+
+# The opposite pattern: a handful of executions, each expensive.
+SQL_EXPENSIVE_SINGLE_RUN_MAX_EXECS = 5.0
+SQL_EXPENSIVE_SINGLE_RUN_MIN_PER_EXEC_S = 5.0
+
+# How many distinct SQL_IDs must share a literal-stripped text signature
+# before we call it out as a likely bind-variable / cursor-sharing problem.
+SQL_BIND_VARIABLE_MIN_GROUP_SIZE = 3
+
+
+SQL_TAG_INFO = {
+    "cpu_bound": {
+        "label": "CPU-bound",
+        "severity": "info",
+        "plain": (
+            "Most of this statement's own run time is spent actively using the CPU rather "
+            "than waiting on disk or locks. This isn't necessarily a problem by itself — it "
+            "can just mean the query is doing legitimate computational work — but it's worth "
+            "a quick look for avoidable causes: sorting, hashing, evaluating functions "
+            "row-by-row, or an inefficient join method, rather than the query being held up "
+            "by something external."
+        ),
+        "recommendations": [
+            "Pull the execution plan (DBMS_XPLAN.DISPLAY_CURSOR or SQL Monitor) and look for "
+            "expensive operations: hash joins/aggregates over large row sets, sorts, or "
+            "row-by-row PL/SQL function calls inside the SQL.",
+            "Check for implicit data type conversions in WHERE clauses (e.g. comparing a "
+            "NUMBER column to a string literal) — these silently disable index usage and "
+            "force extra CPU work evaluating every row.",
+            "If a PL/SQL function is called per-row, consider whether it can be rewritten as "
+            "a scalar subquery, joined lookup, or marked DETERMINISTIC to enable caching.",
+        ],
+    },
+    "io_bound": {
+        "label": "I/O-bound",
+        "severity": "info",
+        "plain": (
+            "Most of this statement's own run time is spent waiting on I/O (mostly physical "
+            "reads from disk). This can be the classic signature of a full table/index scan, "
+            "or simply data that genuinely doesn't fit in the buffer cache — worth a quick "
+            "check of the access path, but not necessarily a problem by itself."
+        ),
+        "recommendations": [
+            "Check the execution plan for full table scans or full index scans and confirm "
+            "whether a more selective index is available (or would help) for this query's "
+            "filter conditions.",
+            "Confirm object statistics are current — the optimizer may be choosing a scan "
+            "because it doesn't have an accurate picture of table/index size or data "
+            "distribution.",
+        ],
+    },
+    "missing_index_suspect": {
+        "label": "Possible missing index",
+        "severity": "warning",
+        "plain": (
+            "This statement performs a very large number of buffer gets (logical block "
+            "reads) per execution. For most OLTP-style statements this is a strong sign that "
+            "the query is scanning far more of the table/index than it needs to, usually "
+            "because a useful index is missing or isn't being used."
+        ),
+        "recommendations": [
+            "Review the execution plan's access path for the driving table(s) — look "
+            "specifically for a full table scan or full index scan where an index range "
+            "scan would be expected.",
+            "Check whether an index exists on the columns in the WHERE clause / join "
+            "predicates, and whether it's actually being chosen by the optimizer (stale "
+            "statistics or a function wrapped around the column can prevent this).",
+            "If this is intentionally a large reporting/batch query, confirm that's the "
+            "case rather than assuming it needs tuning — high gets/execution is only a "
+            "problem if the query is expected to be selective.",
+        ],
+    },
+    "physical_read_heavy": {
+        "label": "Heavy physical reads",
+        "severity": "warning",
+        "plain": (
+            "This statement drives a large number of physical disk reads per execution. "
+            "Even a well-indexed query can do this if it touches data that isn't in the "
+            "buffer cache; combined with a missing-index signal, it usually means the same "
+            "root cause — an inefficient access path reading far more than necessary."
+        ),
+        "recommendations": [
+            "Same first step as a missing-index suspect: check the execution plan's access "
+            "path and available indexes.",
+            "If the access path is already efficient, this may simply reflect a cold cache "
+            "or a genuinely large amount of data being touched — check whether the buffer "
+            "cache is large enough for this table's working set.",
+        ],
+    },
+    "low_selectivity_suspect": {
+        "label": "Low selectivity",
+        "severity": "warning",
+        "plain": (
+            "This statement reads a very large number of blocks (buffer gets) for every row "
+            "it actually returns. That ratio is a strong, direct signal that the access path "
+            "isn't taking advantage of how selective the query's filter really is — Oracle "
+            "is doing a lot of work to throw most of what it reads away."
+        ),
+        "recommendations": [
+            "Check whether an index exists that matches the query's actual filter columns; "
+            "if one exists but isn't used, check for function wrapping, implicit type "
+            "conversion, or stale statistics preventing its use.",
+            "If the query is meant to return a small, specific result, verify the WHERE "
+            "clause is as selective as intended (e.g. no accidentally-omitted filter).",
+        ],
+    },
+    "high_call_volume": {
+        "label": "High call volume",
+        "severity": "info",
+        "plain": (
+            "This statement itself may be cheap per execution, but it's being called so "
+            "often that its cumulative cost is a material share of total database time. "
+            "This pattern (sometimes called 'death by a thousand cuts') often responds "
+            "better to reducing how often the query runs than to tuning the query itself."
+        ),
+        "recommendations": [
+            "Check whether the application is calling this statement in a loop where a "
+            "single set-based query (or a batched/bulk operation) could replace many "
+            "individual calls.",
+            "Consider application-level caching for lookup-style queries that return the "
+            "same result repeatedly within a short window.",
+        ],
+    },
+    "high_impact": {
+        "label": "High overall impact",
+        "severity": "warning",
+        "plain": (
+            "This single statement accounts for a large share of total database time on "
+            "its own. Even without one obvious smoking-gun cause, statements like this are "
+            "usually the highest-leverage place to focus tuning effort, since improving one "
+            "query can measurably improve overall performance."
+        ),
+        "recommendations": [
+            "Pull the execution plan (DBMS_XPLAN.DISPLAY_CURSOR or SQL Monitor) and review "
+            "it end-to-end even if no single metric here stands out — moderate CPU, I/O, "
+            "and call volume can still add up to a large total.",
+            "Consider running SQL Tuning Advisor against this SQL_ID for an automated "
+            "second opinion.",
+        ],
+    },
+    "expensive_single_run": {
+        "label": "Expensive low-frequency query",
+        "severity": "info",
+        "plain": (
+            "This statement runs rarely, but each execution is expensive. Unlike a "
+            "high-volume statement, tuning effort here should focus entirely on the "
+            "execution plan and resource usage of the query itself, since call frequency "
+            "isn't the issue."
+        ),
+        "recommendations": [
+            "Review the execution plan for this specific statement; since it runs "
+            "infrequently, even a one-time SQL Tuning Advisor run is a reasonable next step.",
+            "If this is a known batch/reporting job, consider whether it can run during a "
+            "lower-traffic window or use parallel query to reduce its wall-clock impact.",
+        ],
+    },
+}
