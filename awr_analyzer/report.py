@@ -9,7 +9,6 @@ from __future__ import annotations
 import html as _html
 from datetime import datetime
 
-from . import rules
 from .models import AnalysisResult
 
 SEVERITY_META = {
@@ -59,8 +58,9 @@ def render_html(result: AnalysisResult, trend=None) -> str:
         ("Release", info.release),
         ("CPUs / Cores", f"{_fmt(info.cpus, 0)} / {_fmt(info.cores, 0)}" if info.cpus or info.cores else None),
         ("Memory (GB)", _fmt(info.memory_gb, 1) if info.memory_gb else None),
-        ("Snapshot window", f"{_e(info.begin_snap_time)} &rarr; {_e(info.end_snap_time)}" if info.begin_snap_time else None),
+        ("Snapshot window", f"{info.begin_snap_time} → {info.end_snap_time}" if info.begin_snap_time else None),
         ("Elapsed / DB Time (min)", f"{_fmt(info.elapsed_minutes, 1)} / {_fmt(info.db_time_minutes, 1)}" if info.elapsed_minutes else None),
+        ("Analysis settings", result.config_summary or None),
     ] if value)
 
     counts = result.counts()
@@ -70,8 +70,15 @@ def render_html(result: AnalysisResult, trend=None) -> str:
     )
 
     findings_html = "".join(_render_finding(f) for f in result.findings)
+    if result.suppressed:
+        findings_html += (
+            f'<p style="font-size:0.85rem;color:#666;">{len(result.suppressed)} finding(s) hidden by '
+            f'your configuration\'s suppress list: '
+            f'{_e(", ".join(sorted({f.rule_id for f in result.suppressed})))}</p>'
+        )
 
-    sql_html = _render_sql_insights(result.sql_insights)
+    sql_html = _render_sql_insights(result.sql_insights, result.sql_table_limit)
+    watch_html = _render_watched_sql(result.watched_sql)
 
     trend_html = _render_trend(trend) if trend is not None else ""
 
@@ -153,6 +160,8 @@ def render_html(result: AnalysisResult, trend=None) -> str:
 
   {sql_html}
 
+  {watch_html}
+
   {trend_html}
 
   <p class="footer-note">
@@ -183,29 +192,33 @@ def _render_finding(f) -> str:
       {recs_block}
       <details>
         <summary>Technical detail</summary>
-        <div class="tech">{_e(f.technical_detail)}</div>
+        <div class="tech">{_e(f.technical_detail)}{f"<br>Finding ID: {_e(f.rule_id)}" if f.rule_id else ""}</div>
       </details>
     </div>
     """
 
 
-def _render_sql_insights(sql_analysis) -> str:
+def ranked_sql_rows(sql_analysis, limit: int = 15) -> list:
+    """The statements the Problematic Queries table shows: tagged ones,
+    worst first, or the top few by elapsed time if nothing was tagged."""
+    ranked = sorted(sql_analysis.insights, key=lambda p: (p.severity_rank(), -(p.elapsed_s or 0)))
+    shown = [p for p in ranked if p.tags][:limit]
+    return shown or ranked[:min(5, limit)]
+
+
+def _render_sql_insights(sql_analysis, limit: int = 15) -> str:
     if not sql_analysis or not sql_analysis.insights:
         return ""
 
-    rank_key = lambda p: (p.severity_rank(), -(p.elapsed_s or 0))
-    ranked = sorted(sql_analysis.insights, key=rank_key)
-    shown = [p for p in ranked if p.tags][:15]
-    if not shown:
-        shown = ranked[:5]
+    shown = ranked_sql_rows(sql_analysis, limit)
 
     rows = []
     for p in shown:
         meta = SEVERITY_META.get(p.severity, SEVERITY_META["info"])
         tag_chips = "".join(
             f'<span class="tag-chip" style="background:{meta["bg"]};color:{meta["color"]};">'
-            f'{_e(rules.SQL_TAG_INFO.get(t, {}).get("label", t))}</span>'
-            for t in p.tags
+            f'{_e(label)}</span>'
+            for label in p.tag_labels
         )
         text_full = (p.sql_text or "").strip()
         text_short = text_full[:90] + ("…" if len(text_full) > 90 else "")
@@ -256,6 +269,37 @@ def _render_sql_insights(sql_analysis) -> str:
       </table>
     </div>
     {bind_block}
+    """
+
+
+def _render_watched_sql(watched) -> str:
+    if not watched:
+        return ""
+    rows = []
+    for w in watched:
+        p = w.insight
+        if p is None:
+            status = "Not in this report's top SQL lists (it was either quiet in this window or didn't run)."
+        else:
+            parts = [f"{_fmt(p.pct_elapsed, 1)}% of DB time", f"{_fmt(p.executions, 0)} executions",
+                     f"{_fmt(p.per_exec_s, 3)} s/exec"]
+            if p.gets_per_exec is not None:
+                parts.append(f"{_fmt(p.gets_per_exec, 0)} gets/exec")
+            if p.tag_labels:
+                parts.append("flags: " + ", ".join(p.tag_labels))
+            status = "; ".join(parts)
+        rows.append(f"""
+        <tr class="sql-row"><td><code>{_e(w.sql_id)}</code></td><td>{_e(w.note) or '&mdash;'}</td><td>{_e(status)}</td></tr>
+        """)
+    return f"""
+    <h2 class="section-title">Watched Queries ({len(watched)})</h2>
+    <p style="font-size:0.85rem;color:#666;">Statements on your watchlist, shown whether or not they were flagged.</p>
+    <div class="card">
+      <table class="sql-table">
+        <tr><th>SQL ID</th><th>Your note</th><th>In this report</th></tr>
+        {''.join(rows)}
+      </table>
+    </div>
     """
 
 
@@ -311,6 +355,8 @@ def render_text(result: AnalysisResult, trend=None) -> str:
         lines.append(f"Snapshot window: {info.begin_snap_time} -> {info.end_snap_time}")
     if info.elapsed_minutes:
         lines.append(f"Elapsed: {info.elapsed_minutes:.1f} min   DB Time: {info.db_time_minutes or 0:.1f} min")
+    if result.config_summary:
+        lines.append(f"Analysis settings: {result.config_summary}")
     lines.append("")
     lines.append(f"Health score: {result.health_score}/100")
     lines.append(result.summary)
@@ -328,19 +374,24 @@ def render_text(result: AnalysisResult, trend=None) -> str:
                 lines.append(f"  - {_wrap(r, indent=4)}")
         lines.append("")
         lines.append(f"  Technical detail: {f.technical_detail}")
+        if f.rule_id:
+            lines.append(f"  Finding ID: {f.rule_id}")
+        lines.append("")
+
+    if result.suppressed:
+        ids = ", ".join(sorted({f.rule_id for f in result.suppressed}))
+        lines.append(f"({len(result.suppressed)} finding(s) hidden by your suppress list: {ids})")
         lines.append("")
 
     sql_analysis = result.sql_insights
     if sql_analysis and sql_analysis.insights:
-        rank_key = lambda p: (p.severity_rank(), -(p.elapsed_s or 0))
-        ranked = sorted(sql_analysis.insights, key=rank_key)
-        shown = [p for p in ranked if p.tags][:15] or ranked[:5]
+        shown = ranked_sql_rows(sql_analysis, result.sql_table_limit)
 
         lines.append("=" * 72)
         lines.append(f"PROBLEMATIC QUERIES ({len(shown)} of {len(sql_analysis.insights)} profiled)")
         lines.append("=" * 72)
         for p in shown:
-            tag_labels = ", ".join(rules.SQL_TAG_INFO.get(t, {}).get("label", t) for t in p.tags) or "—"
+            tag_labels = ", ".join(p.tag_labels) or "—"
             cpu_io = ""
             if p.pct_cpu is not None or p.pct_io is not None:
                 cpu_io = f", %CPU={p.pct_cpu if p.pct_cpu is not None else 'n/a'}, %IO={p.pct_io if p.pct_io is not None else 'n/a'}"
@@ -356,6 +407,21 @@ def render_text(result: AnalysisResult, trend=None) -> str:
             for g in sql_analysis.bind_variable_suspects[:5]:
                 lines.append(f"  - {len(g.sql_ids)} SQL_IDs (module: {g.module or 'n/a'}) share near-identical text")
             lines.append("")
+
+    if result.watched_sql:
+        lines.append("=" * 72)
+        lines.append(f"WATCHED QUERIES ({len(result.watched_sql)})")
+        lines.append("=" * 72)
+        for w in result.watched_sql:
+            lines.append(f"  {w.sql_id}" + (f"  — {w.note}" if w.note else ""))
+            p = w.insight
+            if p is None:
+                lines.append("    not in this report's top SQL lists")
+            else:
+                flags = ", ".join(p.tag_labels) or "none"
+                lines.append(f"    %DBtime={_fmt(p.pct_elapsed, 1)}, executions={_fmt(p.executions, 0)}, "
+                             f"per_exec_s={_fmt(p.per_exec_s, 3)}, flags: {flags}")
+        lines.append("")
 
     if trend and trend.results:
         lines.append("=" * 72)

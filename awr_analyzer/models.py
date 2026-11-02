@@ -121,6 +121,10 @@ class Finding:
     technical_detail: str
     recommendations: list = field(default_factory=list)
     evidence: dict = field(default_factory=dict)
+    # Stable identifier for the kind of finding, e.g. "wait.log file sync",
+    # "efficiency.buffer_hit", "sql.fu38d0tdu45js", "custom.<rule name>".
+    # Used to suppress specific findings from the configuration.
+    rule_id: str = ""
 
     def severity_rank(self) -> int:
         try:
@@ -130,12 +134,23 @@ class Finding:
 
 
 @dataclass
+class WatchedSQL:
+    sql_id: str
+    note: str = ""
+    insight: Optional["SQLInsight"] = None   # None when it isn't in this report's top lists
+
+
+@dataclass
 class AnalysisResult:
     report: AWRReport
     findings: list = field(default_factory=list)      # list[Finding]
     health_score: int = 100
     summary: str = ""
     sql_insights: Optional["SQLAnalysis"] = None
+    suppressed: list = field(default_factory=list)    # list[Finding] hidden by the configuration
+    watched_sql: list = field(default_factory=list)   # list[WatchedSQL]
+    config_summary: str = ""
+    sql_table_limit: int = 15
 
     def findings_by_severity(self, severity: str):
         return [f for f in self.findings if f.severity == severity]
@@ -179,6 +194,7 @@ class SQLInsight:
 
     seen_in: list = field(default_factory=list)     # which "SQL ordered by ..." lists mentioned this SQL_ID
     tags: list = field(default_factory=list)        # e.g. ["cpu_bound", "missing_index_suspect"]
+    tag_labels: list = field(default_factory=list)  # display labels, parallel to tags
     severity: str = "info"                          # critical | warning | info
     notes: list = field(default_factory=list)       # plain-language notes, one per tag
     recommendations: list = field(default_factory=list)

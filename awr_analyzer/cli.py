@@ -2,9 +2,17 @@
 
 Usage:
     awr-analyzer analyze report.html
-    awr-analyzer analyze report.html -o insights.html
-    awr-analyzer analyze report.html --format text
+    awr-analyzer analyze report.html -o insights.html --format text
+    awr-analyzer analyze report.html --config team.json --preset data_warehouse
     awr-analyzer trend day1.html day2.html day3.html -o trend.html
+    awr-analyzer tui [report.html]
+    awr-analyzer metrics report.html --filter wait.
+    awr-analyzer config init | show | validate | presets
+
+Settings saved from the interactive mode (``tui``) live in
+~/.awr_analyzer/config.json (or $AWR_ANALYZER_CONFIG) and are picked up
+automatically; ``--config`` points at a different file and ``--no-config``
+ignores it.
 """
 
 from __future__ import annotations
@@ -16,9 +24,18 @@ import sys
 from pathlib import Path
 
 from .analyzer import analyze
+from .config import (
+    PRESETS,
+    AnalyzerConfig,
+    ConfigError,
+    default_config_path,
+    resolve_config,
+)
+from .custom_rules import flatten_metrics
 from .forecast import build_trend
 from .parser import AWRParseError, parse_awr_file
 from .report import render_html, render_text
+from .sql_insights import build_sql_insights
 
 
 def _load_reports(paths):
@@ -36,7 +53,25 @@ def _load_reports(paths):
     return reports
 
 
-def _write_or_print(content: str, out_path, default_name: str):
+def _load_config(args, announce: bool = True) -> AnalyzerConfig:
+    try:
+        cfg = resolve_config(getattr(args, "config", None), getattr(args, "preset", None),
+                             use_default_file=not getattr(args, "no_config", False))
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    problems = cfg.validate()
+    for level, msg in problems:
+        print(f"{level}: settings: {msg}", file=sys.stderr)
+    if any(level == "error" for level, _ in problems):
+        print("error: fix the settings above (or run 'awr-analyzer tui' to edit them)", file=sys.stderr)
+        sys.exit(2)
+    if announce and (cfg.source_path or getattr(args, "preset", None)):
+        print(f"Using settings: {cfg.summary_line()}", file=sys.stderr)
+    return cfg
+
+
+def _write_or_print(content: str, out_path):
     if out_path:
         Path(out_path).write_text(content, encoding="utf-8")
         print(f"Wrote {out_path}")
@@ -45,6 +80,7 @@ def _write_or_print(content: str, out_path, default_name: str):
 
 
 def cmd_analyze(args) -> None:
+    cfg = _load_config(args)
     report = _load_reports([args.report])[0]
 
     if not report.load_profile and not report.top_wait_events and not report.instance_efficiency:
@@ -55,11 +91,10 @@ def cmd_analyze(args) -> None:
             file=sys.stderr,
         )
 
-    result = analyze(report)
+    result = analyze(report, cfg)
 
     if args.format == "json":
-        payload = dataclasses.asdict(result)
-        content = json.dumps(payload, indent=2, default=str)
+        content = json.dumps(dataclasses.asdict(result), indent=2, default=str)
     elif args.format == "text":
         content = render_text(result)
     else:
@@ -68,20 +103,21 @@ def cmd_analyze(args) -> None:
     out_path = args.output
     if out_path is None and args.format == "html":
         out_path = str(Path(args.report).with_suffix("")) + "_analysis.html"
-    _write_or_print(content, out_path, "analysis.html")
+    _write_or_print(content, out_path)
 
     _print_console_summary(result)
 
 
 def cmd_trend(args) -> None:
+    cfg = _load_config(args)
     reports = _load_reports(args.reports)
     if len(reports) < 2:
         print("error: 'trend' needs at least 2 AWR reports to compare", file=sys.stderr)
         sys.exit(2)
 
     # Analyze the most recent report normally, and layer the trend on top.
-    result = analyze(reports[-1])
-    trend = build_trend(reports)
+    result = analyze(reports[-1], cfg)
+    trend = build_trend(reports, cfg)
 
     if args.format == "json":
         payload = {"analysis": dataclasses.asdict(result), "trend": dataclasses.asdict(trend)}
@@ -94,17 +130,18 @@ def cmd_trend(args) -> None:
     out_path = args.output
     if out_path is None and args.format == "html":
         out_path = "awr_trend_report.html"
-    _write_or_print(content, out_path, "awr_trend_report.html")
+    _write_or_print(content, out_path)
 
     _print_console_summary(result, trend)
 
 
 def _print_console_summary(result, trend=None) -> None:
     counts = result.counts()
+    hidden = f", {len(result.suppressed)} hidden by settings" if result.suppressed else ""
     print(
         f"\nHealth score: {result.health_score}/100  "
         f"(critical={counts.get('critical', 0)}, warning={counts.get('warning', 0)}, "
-        f"info={counts.get('info', 0)})"
+        f"info={counts.get('info', 0)}{hidden})"
     )
     if trend:
         risks = trend.emerging_risks()
@@ -112,6 +149,82 @@ def _print_console_summary(result, trend=None) -> None:
             print(f"Trend: {len(risks)} metric(s) trending toward a critical threshold.")
         else:
             print("Trend: no metrics are projected to cross a critical threshold at the current rate.")
+
+
+def cmd_tui(args) -> None:
+    from .tui import run_tui
+
+    cfg = _load_config(args, announce=False)
+    config_path = args.config or str(default_config_path())
+    if args.report and not Path(args.report).is_file():
+        print(f"error: file not found: {args.report}", file=sys.stderr)
+        sys.exit(2)
+    run_tui(config=cfg, config_path=config_path, report_path=args.report)
+
+
+def cmd_metrics(args) -> None:
+    cfg = _load_config(args, announce=False)
+    report = _load_reports([args.report])[0]
+    metrics = flatten_metrics(report, build_sql_insights(report, cfg))
+    needle = (args.filter or "").lower()
+    names = sorted(n for n in metrics if needle in n.lower())
+    if args.format == "json":
+        print(json.dumps({n: metrics[n] for n in names}, indent=2))
+        return
+    width = max((len(n) for n in names), default=10)
+    for name in names:
+        print(f"{name:<{width}}  {metrics[name]:,.6g}")
+    print(f"\n{len(names)} metric(s). Use these names in custom rules; '*' matches anything, "
+          f"e.g. wait.*.avg_wait_ms", file=sys.stderr)
+
+
+def cmd_config_init(args) -> None:
+    target = Path(args.path or default_config_path()).expanduser()
+    if target.exists() and not args.force:
+        print(f"error: {target} already exists (use --force to overwrite)", file=sys.stderr)
+        sys.exit(2)
+    cfg = AnalyzerConfig.from_preset(args.preset) if args.preset else AnalyzerConfig()
+    saved = cfg.save(target)
+    print(f"Created {saved} (preset '{cfg.preset}'). Edit it with 'awr-analyzer tui' or by hand.")
+
+
+def cmd_config_show(args) -> None:
+    cfg = _load_config(args, announce=False)
+    if args.effective:
+        print(cfg.to_json(effective=True))
+        return
+    print(f"Settings: {cfg.summary_line()}")
+    changes = cfg.describe_changes()
+    if not changes:
+        print("No changes from the built-in defaults.")
+    for line in changes:
+        print(f"  {line}")
+
+
+def cmd_config_validate(args) -> None:
+    try:
+        cfg = resolve_config(args.config, None, use_default_file=not args.no_config)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    problems = cfg.validate()
+    for level, msg in problems:
+        print(f"{level}: {msg}")
+    if any(level == "error" for level, _ in problems):
+        sys.exit(1)
+    print(f"OK: {cfg.summary_line()}")
+
+
+def cmd_config_presets(args) -> None:
+    for name, preset in PRESETS.items():
+        print(f"{name}\n    {preset['description']}")
+
+
+def _add_config_args(p: argparse.ArgumentParser, preset: bool = True) -> None:
+    p.add_argument("--config", help=f"Settings file (default: {default_config_path()} if it exists)")
+    p.add_argument("--no-config", action="store_true", help="Ignore the default settings file")
+    if preset:
+        p.add_argument("--preset", choices=list(PRESETS), help="Workload preset to apply")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("report", help="Path to an AWR HTML report")
     p_analyze.add_argument("-o", "--output", help="Output file path (default: <report>_analysis.html)")
     p_analyze.add_argument("--format", choices=["html", "text", "json"], default="html")
+    _add_config_args(p_analyze)
     p_analyze.set_defaults(func=cmd_analyze)
 
     p_trend = sub.add_parser(
@@ -137,7 +251,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_trend.add_argument("-o", "--output", help="Output file path (default: awr_trend_report.html)")
     p_trend.add_argument("--format", choices=["html", "text", "json"], default="html")
+    _add_config_args(p_trend)
     p_trend.set_defaults(func=cmd_trend)
+
+    p_tui = sub.add_parser("tui", aliases=["interactive"],
+                           help="Interactive text interface: analyze reports and customize the analysis")
+    p_tui.add_argument("report", nargs="?", help="Optional AWR report to open straight away")
+    _add_config_args(p_tui)
+    p_tui.set_defaults(func=cmd_tui)
+
+    p_metrics = sub.add_parser("metrics", help="List every metric in a report (names for custom rules)")
+    p_metrics.add_argument("report", help="Path to an AWR HTML report")
+    p_metrics.add_argument("--filter", help="Only show metric names containing this text")
+    p_metrics.add_argument("--format", choices=["text", "json"], default="text")
+    _add_config_args(p_metrics, preset=False)
+    p_metrics.set_defaults(func=cmd_metrics)
+
+    p_config = sub.add_parser("config", help="Create, inspect and check settings files")
+    csub = p_config.add_subparsers(dest="config_command", required=True)
+    c_init = csub.add_parser("init", help="Create a settings file")
+    c_init.add_argument("path", nargs="?", help=f"Where to create it (default: {default_config_path()})")
+    c_init.add_argument("--preset", choices=list(PRESETS))
+    c_init.add_argument("--force", action="store_true", help="Overwrite an existing file")
+    c_init.set_defaults(func=cmd_config_init)
+    c_show = csub.add_parser("show", help="Show what the settings change from the defaults")
+    c_show.add_argument("--effective", action="store_true", help="Print the full merged settings as JSON")
+    _add_config_args(c_show)
+    c_show.set_defaults(func=cmd_config_show)
+    c_val = csub.add_parser("validate", help="Check a settings file for mistakes")
+    _add_config_args(c_val, preset=False)
+    c_val.set_defaults(func=cmd_config_validate)
+    c_pre = csub.add_parser("presets", help="List the workload presets")
+    c_pre.set_defaults(func=cmd_config_presets)
 
     return parser
 

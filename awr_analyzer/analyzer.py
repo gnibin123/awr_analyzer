@@ -5,28 +5,49 @@ health score.
 The goal is that someone without deep Oracle experience can read a finding
 top to bottom and understand: what's happening, why it matters, and what to
 do about it — while a DBA can still see the exact numbers behind it.
+
+What counts as a problem, and what the explanation says, comes from an
+:class:`~awr_analyzer.config.AnalyzerConfig`; with no config the built-in
+defaults apply.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Optional
 
-from . import rules
-from . import sql_insights
-from .models import AnalysisResult, AWRReport, Finding
+from . import custom_rules, sql_insights
+from .config import AnalyzerConfig
+from .models import AnalysisResult, AWRReport, Finding, WatchedSQL
 
 
-def analyze(report: AWRReport) -> AnalysisResult:
+def analyze(report: AWRReport, config: Optional[AnalyzerConfig] = None) -> AnalysisResult:
+    cfg = config or AnalyzerConfig()
     findings = []
 
-    sql_analysis = sql_insights.build_sql_insights(report)
+    sql_analysis = sql_insights.build_sql_insights(report, cfg)
 
-    _check_efficiency(report, findings)
-    _check_wait_events(report, findings)
-    _check_cpu_load(report, findings)
-    _check_parse_rate(report, findings)
-    _check_sql(sql_analysis, findings)
-    _check_tablespace_io(report, findings)
+    if cfg.check_enabled("efficiency"):
+        _check_efficiency(report, findings, cfg)
+    if cfg.check_enabled("wait_events"):
+        _check_wait_events(report, findings, cfg)
+    if cfg.check_enabled("cpu_load"):
+        _check_cpu_load(report, findings, cfg)
+    if cfg.check_enabled("parse_rate"):
+        _check_parse_rate(report, findings, cfg)
+    if cfg.check_enabled("sql"):
+        _check_sql(sql_analysis, findings, cfg)
+    if cfg.check_enabled("bind_variables"):
+        _check_bind_variables(sql_analysis, findings)
+    if cfg.check_enabled("tablespace_io"):
+        _check_tablespace_io(report, findings, cfg)
+    if cfg.check_enabled("custom_rules") and cfg.custom_rules():
+        metrics = custom_rules.flatten_metrics(report, sql_analysis)
+        findings.extend(custom_rules.evaluate_rules(
+            cfg.custom_rules(), metrics, cfg.limit("max_custom_rule_matches")))
+
+    suppressed = [f for f in findings if cfg.is_suppressed(f.rule_id)]
+    findings = [f for f in findings if not cfg.is_suppressed(f.rule_id)]
 
     if not findings:
         findings.append(Finding(
@@ -40,30 +61,29 @@ def analyze(report: AWRReport) -> AnalysisResult:
                 "how users actually experienced this time window."
             ),
             technical_detail="No metric breached its configured warning/critical threshold.",
+            rule_id="general.no_issues",
         ))
 
     findings.sort(key=lambda f: f.severity_rank())
-    health_score = _health_score(findings)
-    summary = _summary_text(report, findings, health_score)
+    health_score = _health_score(findings, cfg)
+    summary = _summary_text(report, findings)
     return AnalysisResult(
         report=report, findings=findings, health_score=health_score, summary=summary,
-        sql_insights=sql_analysis,
+        sql_insights=sql_analysis, suppressed=suppressed,
+        watched_sql=_watched_sql(sql_analysis, cfg),
+        config_summary=cfg.summary_line(),
+        sql_table_limit=cfg.limit("max_sql_table_rows"),
     )
 
 
-def _health_score(findings) -> int:
-    score = 100
+def _health_score(findings, cfg: AnalyzerConfig) -> int:
+    score = 100.0
     for f in findings:
-        if f.severity == "critical":
-            score -= 20
-        elif f.severity == "warning":
-            score -= 8
-        elif f.severity == "info":
-            score -= 0
-    return max(0, min(100, score))
+        score -= cfg.score_weight(f.severity)
+    return int(max(0, min(100, round(score))))
 
 
-def _summary_text(report: AWRReport, findings, health_score: int) -> str:
+def _summary_text(report: AWRReport, findings) -> str:
     counts = {"critical": 0, "warning": 0, "info": 0, "good": 0}
     for f in findings:
         counts[f.severity] = counts.get(f.severity, 0) + 1
@@ -73,34 +93,40 @@ def _summary_text(report: AWRReport, findings, health_score: int) -> str:
         window = f" over a {report.info.elapsed_minutes:.0f}-minute window"
 
     if counts["critical"]:
-        headline = (
+        return (
             f"This AWR snapshot{window} shows {counts['critical']} critical issue(s) that "
             f"likely had a noticeable impact on performance, plus {counts['warning']} "
             f"item(s) worth reviewing."
         )
-    elif counts["warning"]:
-        headline = (
+    if counts["warning"]:
+        return (
             f"This AWR snapshot{window} looks broadly healthy, but has {counts['warning']} "
             f"item(s) worth keeping an eye on before they become bigger problems."
         )
-    else:
-        headline = f"This AWR snapshot{window} does not show any significant performance issues."
+    return f"This AWR snapshot{window} does not show any significant performance issues."
 
-    return headline
+
+def _watched_sql(sql_analysis, cfg: AnalyzerConfig) -> list:
+    by_id = {p.sql_id.lower(): p for p in sql_analysis.insights}
+    return [
+        WatchedSQL(sql_id=sql_id, note=note or "", insight=by_id.get(sql_id.lower()))
+        for sql_id, note in sorted(cfg.watchlist().items())
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Individual checks
 # ---------------------------------------------------------------------------
 
-def _check_efficiency(report: AWRReport, findings: list) -> None:
-    for key, (warn_below, crit_below) in rules.EFFICIENCY_THRESHOLDS.items():
+def _check_efficiency(report: AWRReport, findings: list, cfg: AnalyzerConfig) -> None:
+    for key, spec in cfg.efficiency().items():
+        if not spec.get("enabled", True):
+            continue
         value = report.instance_efficiency.get(key)
         if value is None:
             continue
-        label = rules.EFFICIENCY_LABELS.get(key, key)
-        explanation = rules.EFFICIENCY_EXPLANATIONS.get(key, "")
-        recs = rules.EFFICIENCY_RECOMMENDATIONS.get(key, [])
+        warn_below, crit_below = float(spec["warning"]), float(spec["critical"])
+        label = spec.get("label") or key
 
         if value < crit_below:
             severity = "critical"
@@ -113,18 +139,20 @@ def _check_efficiency(report: AWRReport, findings: list) -> None:
             severity=severity,
             category="Efficiency",
             title=f"{label} is low ({value:.1f}%)",
-            plain_explanation=explanation,
+            plain_explanation=spec.get("explanation", ""),
             technical_detail=(
-                f"{label} = {value:.2f}%. Expected to normally stay above {warn_below:.0f}%; "
-                f"below {crit_below:.0f}% is a strong signal of a real problem."
+                f"{label} = {value:.2f}%. Expected to normally stay above {warn_below:g}%; "
+                f"below {crit_below:g}% is a strong signal of a real problem."
             ),
-            recommendations=recs,
+            recommendations=list(spec.get("recommendations") or []),
             evidence={"metric": key, "value": value,
                       "warning_threshold": warn_below, "critical_threshold": crit_below},
+            rule_id=f"efficiency.{key}",
         ))
 
 
-def _check_wait_events(report: AWRReport, findings: list) -> None:
+def _check_wait_events(report: AWRReport, findings: list, cfg: AnalyzerConfig) -> None:
+    t = cfg.threshold
     for we in report.top_wait_events:
         name = (we.event or "").strip()
         if not name:
@@ -140,53 +168,40 @@ def _check_wait_events(report: AWRReport, findings: list) -> None:
         # (sometimes >100%) for exactly those events.
         pct = we.pct_db_time
 
-        kb = rules.lookup_wait_event(name)
-
+        kb = cfg.lookup_wait_event(name)
         is_idle = kb is not None and kb["category"] == "Idle/Network"
 
         severity = None
         triggered_by = None
         if pct is not None and not is_idle:
-            if pct >= rules.WAIT_EVENT_PCT_CRITICAL:
-                severity = "critical"
-                triggered_by = "pct"
-            elif pct >= rules.WAIT_EVENT_PCT_WARNING:
-                severity = "warning"
-                triggered_by = "pct"
+            if pct >= t("wait_event_pct_critical"):
+                severity, triggered_by = "critical", "pct"
+            elif pct >= t("wait_event_pct_warning"):
+                severity, triggered_by = "warning", "pct"
 
         # Special-case: sequential read latency can be a problem even if it's
         # not the single biggest contributor to DB time.
         if severity is None and re.search(r"^db file sequential read", name, re.I) and we.avg_wait_ms:
-            if we.avg_wait_ms >= rules.SEQ_READ_MS_CRITICAL:
-                severity = "critical"
-                triggered_by = "latency"
-            elif we.avg_wait_ms >= rules.SEQ_READ_MS_WARNING:
-                severity = "warning"
-                triggered_by = "latency"
+            if we.avg_wait_ms >= t("seq_read_ms_critical"):
+                severity, triggered_by = "critical", "latency"
+            elif we.avg_wait_ms >= t("seq_read_ms_warning"):
+                severity, triggered_by = "warning", "latency"
 
         if severity is None:
             continue
 
-        plain = kb["plain"] if kb else (
+        plain = kb["plain"] if kb and kb.get("plain") else (
             f"'{name}' is consuming a significant share of database time, but this tool "
             f"doesn't have specific guidance for this particular wait event yet. It's worth "
             f"researching this event name directly (Oracle's documentation and MOS notes are "
-            f"good sources) to understand what it means for this workload."
+            f"good sources) to understand what it means for this workload. You can add your "
+            f"own explanation for it in the interactive mode (awr-analyzer tui)."
         )
         recs = list(kb["recommendations"]) if kb else [
             f"Search Oracle documentation / My Oracle Support for the wait event '{name}' to "
             f"understand its specific cause.",
         ]
         category = kb["category"] if kb else "Other"
-
-        evidence = {
-            "event": name,
-            "waits": we.waits,
-            "total_wait_time_sec": we.total_wait_time_sec,
-            "avg_wait_ms": we.avg_wait_ms,
-            "pct_db_time": pct,
-            "wait_class": we.wait_class,
-        }
 
         pct_text = f"{pct:.1f}% of total DB time" if pct is not None else "a significant share of DB time"
         avg_text = f", averaging {we.avg_wait_ms:.2f} ms per wait" if we.avg_wait_ms is not None else ""
@@ -207,11 +222,19 @@ def _check_wait_events(report: AWRReport, findings: list) -> None:
                 f"{pct_text}."
             ),
             recommendations=recs,
-            evidence=evidence,
+            evidence={
+                "event": name,
+                "waits": we.waits,
+                "total_wait_time_sec": we.total_wait_time_sec,
+                "avg_wait_ms": we.avg_wait_ms,
+                "pct_db_time": pct,
+                "wait_class": we.wait_class,
+            },
+            rule_id=f"wait.{name}",
         ))
 
 
-def _check_cpu_load(report: AWRReport, findings: list) -> None:
+def _check_cpu_load(report: AWRReport, findings: list, cfg: AnalyzerConfig) -> None:
     cpu_pct = None
     cpu_time_s = None
     for we in report.top_wait_events:
@@ -229,9 +252,9 @@ def _check_cpu_load(report: AWRReport, findings: list) -> None:
     if cpu_pct is None:
         return
 
-    if cpu_pct >= rules.DB_CPU_PCT_CRITICAL:
+    if cpu_pct >= cfg.threshold("db_cpu_pct_critical"):
         severity = "critical"
-    elif cpu_pct >= rules.DB_CPU_PCT_WARNING:
+    elif cpu_pct >= cfg.threshold("db_cpu_pct_warning"):
         severity = "warning"
     else:
         return
@@ -272,10 +295,11 @@ def _check_cpu_load(report: AWRReport, findings: list) -> None:
             "whether more CPU capacity or read replicas/offloading is needed as load grows.",
         ],
         evidence={"cpu_pct_db_time": cpu_pct, "cpu_time_sec": cpu_time_s},
+        rule_id="cpu.db_cpu",
     ))
 
 
-def _check_parse_rate(report: AWRReport, findings: list) -> None:
+def _check_parse_rate(report: AWRReport, findings: list, cfg: AnalyzerConfig) -> None:
     hard_parse_key = next((k for k in report.load_profile if "hard_pars" in k), None)
     if not hard_parse_key:
         return
@@ -283,9 +307,9 @@ def _check_parse_rate(report: AWRReport, findings: list) -> None:
     if value is None:
         return
 
-    if value >= rules.HARD_PARSE_CRITICAL:
+    if value >= cfg.threshold("hard_parse_critical"):
         severity = "critical"
-    elif value >= rules.HARD_PARSE_WARNING:
+    elif value >= cfg.threshold("hard_parse_warning"):
         severity = "warning"
     else:
         return
@@ -311,15 +335,16 @@ def _check_parse_rate(report: AWRReport, findings: list) -> None:
             "temporary relief, not a fix.",
         ],
         evidence={"hard_parses_per_sec": value},
+        rule_id="parse.hard_parse_rate",
     ))
 
 
-def _check_sql(sql_analysis, findings: list) -> None:
+def _check_sql(sql_analysis, findings: list, cfg: AnalyzerConfig) -> None:
     problematic = [p for p in sql_analysis.insights if p.severity in ("critical", "warning")]
     problematic.sort(key=lambda p: (p.severity_rank(), -(p.elapsed_s or 0)))
 
-    for p in problematic[:8]:
-        tag_labels = ", ".join(rules.SQL_TAG_INFO[t]["label"] for t in p.tags)
+    for p in problematic[:cfg.limit("max_sql_findings")]:
+        tag_labels = ", ".join(p.tag_labels)
 
         exec_note = ""
         if p.executions:
@@ -348,6 +373,10 @@ def _check_sql(sql_analysis, findings: list) -> None:
         if text_snippet:
             detail_parts.append(f"text: {text_snippet}")
 
+        note = cfg.watchlist().get(p.sql_id)
+        if note:
+            plain += f" Your note on this statement: {note}"
+
         findings.append(Finding(
             severity=p.severity,
             category="SQL",
@@ -360,51 +389,56 @@ def _check_sql(sql_analysis, findings: list) -> None:
                 "executions": p.executions, "gets_per_exec": p.gets_per_exec,
                 "reads_per_exec": p.reads_per_exec, "pct_cpu": p.pct_cpu, "pct_io": p.pct_io,
             },
-        ))
-
-    if sql_analysis.bind_variable_suspects:
-        groups = sql_analysis.bind_variable_suspects[:5]
-        lines = []
-        for g in groups:
-            id_list = ", ".join(g.sql_ids[:5]) + ("..." if len(g.sql_ids) > 5 else "")
-            lines.append(f"{len(g.sql_ids)} SQL_IDs ({id_list})")
-
-        findings.append(Finding(
-            severity="warning",
-            category="Parsing",
-            title=f"Likely missing bind variables: {len(groups)} group(s) of near-identical SQL",
-            plain_explanation=(
-                "Several distinct SQL_IDs share what looks like the same statement once "
-                "literal values (numbers and quoted strings) are stripped out. This is the "
-                "classic signature of an application embedding literal values directly in "
-                "SQL text instead of using bind variables, which forces Oracle to hard-parse "
-                "and separately cache a version of the statement for every distinct value."
-            ),
-            technical_detail=" | ".join(lines),
-            recommendations=[
-                "Have the application use bind variables for these statements so identical "
-                "statement shapes share one parsed cursor instead of each literal value "
-                "creating a new hard-parsed copy.",
-                "Check the Soft Parse Ratio and hard-parse-rate findings elsewhere in this "
-                "report — this pattern is usually the direct cause of both.",
-            ],
-            evidence={"groups": [
-                {"signature": g.signature, "sql_ids": g.sql_ids, "module": g.module}
-                for g in groups
-            ]},
+            rule_id=f"sql.{p.sql_id}",
         ))
 
 
-def _check_tablespace_io(report: AWRReport, findings: list) -> None:
+def _check_bind_variables(sql_analysis, findings: list) -> None:
+    if not sql_analysis.bind_variable_suspects:
+        return
+    groups = sql_analysis.bind_variable_suspects[:5]
+    lines = []
+    for g in groups:
+        id_list = ", ".join(g.sql_ids[:5]) + ("..." if len(g.sql_ids) > 5 else "")
+        lines.append(f"{len(g.sql_ids)} SQL_IDs ({id_list})")
+
+    findings.append(Finding(
+        severity="warning",
+        category="Parsing",
+        title=f"Likely missing bind variables: {len(groups)} group(s) of near-identical SQL",
+        plain_explanation=(
+            "Several distinct SQL_IDs share what looks like the same statement once "
+            "literal values (numbers and quoted strings) are stripped out. This is the "
+            "classic signature of an application embedding literal values directly in "
+            "SQL text instead of using bind variables, which forces Oracle to hard-parse "
+            "and separately cache a version of the statement for every distinct value."
+        ),
+        technical_detail=" | ".join(lines),
+        recommendations=[
+            "Have the application use bind variables for these statements so identical "
+            "statement shapes share one parsed cursor instead of each literal value "
+            "creating a new hard-parsed copy.",
+            "Check the Soft Parse Ratio and hard-parse-rate findings elsewhere in this "
+            "report — this pattern is usually the direct cause of both.",
+        ],
+        evidence={"groups": [
+            {"signature": g.signature, "sql_ids": g.sql_ids, "module": g.module}
+            for g in groups
+        ]},
+        rule_id="sql.bind_variables",
+    ))
+
+
+def _check_tablespace_io(report: AWRReport, findings: list, cfg: AnalyzerConfig) -> None:
     for ts in report.tablespace_io:
         ms = ts.avg_read_time_ms
         if ms is None:
             continue
-        if not ts.reads or ts.reads < rules.TS_MIN_READS_FOR_LATENCY_CHECK:
+        if not ts.reads or ts.reads < cfg.threshold("ts_min_reads"):
             continue  # too few reads in the window for the average to be a reliable signal
-        if ms >= rules.TS_READ_MS_CRITICAL:
+        if ms >= cfg.threshold("ts_read_ms_critical"):
             severity = "critical"
-        elif ms >= rules.TS_READ_MS_WARNING:
+        elif ms >= cfg.threshold("ts_read_ms_warning"):
             severity = "warning"
         else:
             continue
@@ -431,4 +465,5 @@ def _check_tablespace_io(report: AWRReport, findings: list) -> None:
                 "one does, the issue may be specific to that storage path or device).",
             ],
             evidence={"tablespace": ts.tablespace, "avg_read_time_ms": ms, "reads": ts.reads},
+            rule_id=f"tablespace.{ts.tablespace}",
         ))

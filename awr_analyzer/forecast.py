@@ -12,11 +12,11 @@ early, not a precise prediction.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Optional
 
-from . import rules
+from .config import AnalyzerConfig
 from .models import AWRReport
 
 _DATE_FORMATS = [
@@ -76,19 +76,29 @@ class MetricDef:
     extractor: Callable[[AWRReport], Optional[float]]
     critical_threshold: Optional[float] = None
     threshold_is_upper_bound: bool = True  # True: bad when value rises above; False: bad when value falls below
+    # Looks the critical threshold up in the user's config at trend time.
+    threshold_fn: Optional[Callable[[AnalyzerConfig], float]] = None
+
+
+def _eff_crit(key: str) -> Callable[[AnalyzerConfig], float]:
+    return lambda cfg: float(cfg.efficiency()[key]["critical"])
+
+
+def _thr(key: str) -> Callable[[AnalyzerConfig], float]:
+    return lambda cfg: cfg.threshold(key)
 
 
 TRACKED_METRICS = [
     MetricDef("aas", "Average Active Sessions", "sessions", None, _aas),
     MetricDef("buffer_hit", "Buffer Cache Hit Ratio", "%", "up",
               lambda r: r.instance_efficiency.get("buffer_hit"),
-              critical_threshold=rules.EFFICIENCY_THRESHOLDS["buffer_hit"][1], threshold_is_upper_bound=False),
+              threshold_is_upper_bound=False, threshold_fn=_eff_crit("buffer_hit")),
     MetricDef("library_hit", "Library Cache Hit Ratio", "%", "up",
               lambda r: r.instance_efficiency.get("library_hit"),
-              critical_threshold=rules.EFFICIENCY_THRESHOLDS["library_hit"][1], threshold_is_upper_bound=False),
+              threshold_is_upper_bound=False, threshold_fn=_eff_crit("library_hit")),
     MetricDef("soft_parse", "Soft Parse Ratio", "%", "up",
               lambda r: r.instance_efficiency.get("soft_parse"),
-              critical_threshold=rules.EFFICIENCY_THRESHOLDS["soft_parse"][1], threshold_is_upper_bound=False),
+              threshold_is_upper_bound=False, threshold_fn=_eff_crit("soft_parse")),
     MetricDef("physical_reads", "Physical Reads", "blocks/sec", "down",
               lambda r: _lp(r, "physical_read")),
     MetricDef("logical_reads", "Logical Reads", "blocks/sec", "down",
@@ -97,13 +107,13 @@ TRACKED_METRICS = [
               lambda r: _lp(r, "redo_size")),
     MetricDef("hard_parses", "Hard Parses", "per sec", "down",
               lambda r: _lp(r, "hard_pars"),
-              critical_threshold=rules.HARD_PARSE_CRITICAL, threshold_is_upper_bound=True),
+              threshold_is_upper_bound=True, threshold_fn=_thr("hard_parse_critical")),
     MetricDef("db_cpu_pct", "DB CPU (% of DB time)", "%", "down",
               lambda r: _wait_field(r, r"^db cpu$|^cpu time$", "pct_db_time"),
-              critical_threshold=rules.DB_CPU_PCT_CRITICAL, threshold_is_upper_bound=True),
+              threshold_is_upper_bound=True, threshold_fn=_thr("db_cpu_pct_critical")),
     MetricDef("seq_read_ms", "'db file sequential read' avg wait", "ms", "down",
               lambda r: _wait_field(r, r"^db file sequential read", "avg_wait_ms"),
-              critical_threshold=rules.SEQ_READ_MS_CRITICAL, threshold_is_upper_bound=True),
+              threshold_is_upper_bound=True, threshold_fn=_thr("seq_read_ms_critical")),
 ]
 
 
@@ -146,8 +156,9 @@ class TrendAnalysis:
 _STABLE_EPSILON_FRACTION = 0.01  # slope smaller than 1% of the metric's average value counts as "stable"
 
 
-def build_trend(reports: list) -> TrendAnalysis:
+def build_trend(reports: list, config: Optional[AnalyzerConfig] = None) -> TrendAnalysis:
     """``reports`` should already be in chronological order (oldest first)."""
+    cfg = config or AnalyzerConfig()
     labels = []
     for i, r in enumerate(reports):
         ts = _parse_time(r.info.begin_snap_time)
@@ -160,6 +171,8 @@ def build_trend(reports: list) -> TrendAnalysis:
 
     results = []
     for mdef in TRACKED_METRICS:
+        if mdef.threshold_fn is not None:
+            mdef = replace(mdef, critical_threshold=mdef.threshold_fn(cfg))
         points = []
         for i, r in enumerate(reports):
             v = mdef.extractor(r)

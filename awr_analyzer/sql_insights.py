@@ -15,8 +15,9 @@ built from whatever is available and left blank (None) elsewhere.
 from __future__ import annotations
 
 import re
+from typing import Optional
 
-from . import rules
+from .config import AnalyzerConfig
 from .models import AWRReport, BindVariableSuspectGroup, SQLAnalysis, SQLInsight
 
 _LIST_NAMES = {
@@ -91,52 +92,60 @@ def _merge(report: AWRReport) -> dict:
     return profiles
 
 
-def _add_tag(p: SQLInsight, key: str, severity_override: str = None) -> None:
-    info = rules.SQL_TAG_INFO[key]
+def _add_tag(p: SQLInsight, key: str, cfg: AnalyzerConfig, critical: bool = False) -> None:
+    """Tiered tags (missing index, heavy reads, low selectivity, high impact)
+    use the tag's configured severity for the warning tier and "critical"
+    above the critical threshold; other tags always use the configured one."""
+    info = cfg.sql_tag(key)
+    if not info.get("enabled", True):
+        return
     p.tags.append(key)
-    p.notes.append(info["plain"])
-    p.recommendations.extend(info["recommendations"])
-    severity = severity_override or info["severity"]
+    p.tag_labels.append(info.get("label") or key)
+    if info.get("plain"):
+        p.notes.append(info["plain"])
+    p.recommendations.extend(info.get("recommendations") or [])
+    severity = "critical" if critical else info.get("severity", "info")
     if _SEVERITY_ORDER.get(severity, 9) < _SEVERITY_ORDER.get(p.severity, 9):
         p.severity = severity
 
 
-def _classify(p: SQLInsight) -> None:
-    if p.pct_cpu is not None and p.pct_cpu >= rules.SQL_CPU_BOUND_PCT:
-        _add_tag(p, "cpu_bound")
+def _classify(p: SQLInsight, cfg: AnalyzerConfig) -> None:
+    t = cfg.threshold
 
-    if p.pct_io is not None and p.pct_io >= rules.SQL_IO_BOUND_PCT:
-        _add_tag(p, "io_bound")
+    if p.pct_cpu is not None and p.pct_cpu >= t("sql_cpu_bound_pct"):
+        _add_tag(p, "cpu_bound", cfg)
 
-    if p.gets_per_exec is not None and p.gets_per_exec >= rules.SQL_GETS_PER_EXEC_WARNING:
-        sev = "critical" if p.gets_per_exec >= rules.SQL_GETS_PER_EXEC_CRITICAL else "warning"
-        _add_tag(p, "missing_index_suspect", sev)
+    if p.pct_io is not None and p.pct_io >= t("sql_io_bound_pct"):
+        _add_tag(p, "io_bound", cfg)
 
-    if p.reads_per_exec is not None and p.reads_per_exec >= rules.SQL_READS_PER_EXEC_WARNING:
-        sev = "critical" if p.reads_per_exec >= rules.SQL_READS_PER_EXEC_CRITICAL else "warning"
-        _add_tag(p, "physical_read_heavy", sev)
+    if p.gets_per_exec is not None and p.gets_per_exec >= t("sql_gets_per_exec_warning"):
+        _add_tag(p, "missing_index_suspect", cfg,
+                 critical=p.gets_per_exec >= t("sql_gets_per_exec_critical"))
+
+    if p.reads_per_exec is not None and p.reads_per_exec >= t("sql_reads_per_exec_warning"):
+        _add_tag(p, "physical_read_heavy", cfg,
+                 critical=p.reads_per_exec >= t("sql_reads_per_exec_critical"))
 
     if p.gets_per_exec and p.rows_per_exec:
         gets_per_row = p.gets_per_exec / p.rows_per_exec
-        if gets_per_row >= rules.SQL_GETS_PER_ROW_WARNING:
-            sev = "critical" if gets_per_row >= rules.SQL_GETS_PER_ROW_CRITICAL else "warning"
-            _add_tag(p, "low_selectivity_suspect", sev)
+        if gets_per_row >= t("sql_gets_per_row_warning"):
+            _add_tag(p, "low_selectivity_suspect", cfg,
+                     critical=gets_per_row >= t("sql_gets_per_row_critical"))
 
-    if ((p.executions or 0) >= rules.SQL_HIGH_VOLUME_EXECUTIONS
-            and (p.pct_elapsed or 0) >= rules.SQL_HIGH_VOLUME_MIN_PCT_ELAPSED):
-        _add_tag(p, "high_call_volume")
+    if ((p.executions or 0) >= t("sql_high_volume_executions")
+            and (p.pct_elapsed or 0) >= t("sql_high_volume_min_pct_elapsed")):
+        _add_tag(p, "high_call_volume", cfg)
 
-    if (p.executions is not None and p.executions <= rules.SQL_EXPENSIVE_SINGLE_RUN_MAX_EXECS
-            and (p.per_exec_s or 0) >= rules.SQL_EXPENSIVE_SINGLE_RUN_MIN_PER_EXEC_S):
-        _add_tag(p, "expensive_single_run")
+    if (p.executions is not None and p.executions <= t("sql_expensive_single_run_max_execs")
+            and (p.per_exec_s or 0) >= t("sql_expensive_single_run_min_per_exec_s")):
+        _add_tag(p, "expensive_single_run", cfg)
 
     # A query dominating DB time deserves a warning/critical flag even if
     # every tag it tripped so far was only informational (e.g. high call
     # volume, expensive single run) rather than a specific tuning mechanism.
     if p.severity not in ("critical", "warning") and p.pct_elapsed is not None \
-            and p.pct_elapsed >= rules.SQL_PCT_WARNING:
-        sev = "critical" if p.pct_elapsed >= rules.SQL_PCT_CRITICAL else "warning"
-        _add_tag(p, "high_impact", sev)
+            and p.pct_elapsed >= t("sql_pct_warning"):
+        _add_tag(p, "high_impact", cfg, critical=p.pct_elapsed >= t("sql_pct_critical"))
 
     p.recommendations = list(dict.fromkeys(p.recommendations))  # de-dupe, keep order
 
@@ -156,7 +165,7 @@ def _normalize_signature(text: str):
     return t
 
 
-def _find_bind_variable_suspects(profiles: dict) -> list:
+def _find_bind_variable_suspects(profiles: dict, min_group_size: float) -> list:
     groups: dict = {}
     for p in profiles.values():
         sig = _normalize_signature(p.sql_text)
@@ -167,7 +176,7 @@ def _find_bind_variable_suspects(profiles: dict) -> list:
     suspects = []
     for sig, plist in groups.items():
         distinct_ids = sorted({p.sql_id for p in plist})
-        if len(distinct_ids) >= rules.SQL_BIND_VARIABLE_MIN_GROUP_SIZE:
+        if len(distinct_ids) >= min_group_size:
             suspects.append(BindVariableSuspectGroup(
                 signature=sig, sql_ids=distinct_ids,
                 module=plist[0].module, sample_text=plist[0].sql_text,
@@ -176,8 +185,12 @@ def _find_bind_variable_suspects(profiles: dict) -> list:
     return suspects
 
 
-def build_sql_insights(report: AWRReport) -> SQLAnalysis:
+def build_sql_insights(report: AWRReport, cfg: Optional[AnalyzerConfig] = None) -> SQLAnalysis:
+    cfg = cfg or AnalyzerConfig()
     profiles = _merge(report)
+    ignored = cfg.ignored_sql_ids()
+    if ignored:
+        profiles = {k: v for k, v in profiles.items() if k.lower() not in ignored}
     db_time_sec = (report.info.db_time_minutes or 0) * 60
 
     for p in profiles.values():
@@ -185,8 +198,10 @@ def build_sql_insights(report: AWRReport) -> SQLAnalysis:
             p.per_exec_s = p.elapsed_s / p.executions
         if p.pct_elapsed is None and p.elapsed_s is not None and db_time_sec:
             p.pct_elapsed = (p.elapsed_s / db_time_sec) * 100
-        _classify(p)
+        _classify(p, cfg)
 
     insights = sorted(profiles.values(), key=lambda p: (p.elapsed_s or 0), reverse=True)
-    suspects = _find_bind_variable_suspects(profiles)
+    suspects = []
+    if cfg.check_enabled("bind_variables"):
+        suspects = _find_bind_variable_suspects(profiles, cfg.threshold("sql_bind_variable_min_group_size"))
     return SQLAnalysis(insights=insights, bind_variable_suspects=suspects)
